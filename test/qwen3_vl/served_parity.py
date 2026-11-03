@@ -14,7 +14,7 @@ served reply (its sampled ids, ``return_token_ids``), and runs transformers' sdp
 forward over the whole sequence; a position agrees when its argmax is the next
 token. The bar is transformers' eager-attention greedy reply scored the same
 way: the served model must agree at least as often as transformers does with
-itself. Exits nonzero below it.
+itself. Exits nonzero below it, on the gate or on the video subset when given.
 """
 from __future__ import annotations
 
@@ -212,12 +212,13 @@ def score(args) -> int:
     rate = {name: hit / n for name, (hit, n) in totals.items()}
     for name, (hit, n) in totals.items():
         print(f"{name:9s} gate  {hit}/{n} = {rate[name]:.4f}")
+    video_passed = True
     if ("served", "video") in per_kind:
         (sv, sn), (ev, en) = per_kind[("served", "video")], per_kind[("hf eager", "video")]
-        verdict = "PASS" if sv / sn >= ev / en else "FAIL"
-        print(f"video subset: {verdict} (served {sv / sn:.4f} vs hf eager {ev / en:.4f})")
+        video_passed = sv / sn >= ev / en
+        print(f"video subset: {'PASS' if video_passed else 'FAIL'} (served {sv / sn:.4f} vs hf eager {ev / en:.4f})")
     Path(args.out).write_text(json.dumps(data))  # with each item's hits, for a closer look
-    passed = rate["served"] >= rate["hf eager"]
+    passed = rate["served"] >= rate["hf eager"] and video_passed
     print("PASS" if passed else "FAIL", f"(served {rate['served']:.4f} vs hf eager {rate['hf eager']:.4f})")
     return 0 if passed else 1
 
