@@ -102,9 +102,9 @@ class VisionPatchMerger(nn.Module):
 
 
 class FrameSDPA:
-    """Stands in for the ragged resource where none is declared (a model's SDPA mode, the
-    reference's own kernel): SDPA within each frame of ``lengths`` (``vision_seq_lengths``),
-    set before each tower call."""
+    """SDPA within each frame of ``lengths`` (``vision_seq_lengths``), the call transformers
+    makes: bound in place of the ragged resource to run the tower outside the engine (a test,
+    or the reference's own kernel)."""
 
     def __init__(self, lengths=()):
         self.lengths = list(lengths)

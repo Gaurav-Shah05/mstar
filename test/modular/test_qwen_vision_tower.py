@@ -79,18 +79,3 @@ def test_bf16_tower_matches_transformers_with_fp32_rope():
     assert torch.equal(got, want.pooler_output)
     assert torch.equal(features[0], want.deepstack_features[0])
 
-
-@pytest.mark.skip(
-    reason="the shared VisionAttention (components/qwen3_vit.py, from main) rebinds to None on a node "
-    "without the resource; this tower's own copy kept the binding, and the merge with main took main's. "
-    "No served model binds the tower outside its own node."
-)
-def test_a_node_without_the_resource_keeps_the_binding():
-    """The engine binds a node's resources into every layer; a tower its owner bound to
-    per-frame attention keeps it on a node that declares no vision resource."""
-    tower = QwenVisionModel(QwenVisionConfig(**SIZES))
-    frames = FrameSDPA(vision_seq_lengths(GRID))
-    for block in tower.blocks:
-        block.attn.bind_resources({VISION_ATTN: frames})
-        block.attn.bind_resources({})
-        assert block.attn.ragged_attn is frames
