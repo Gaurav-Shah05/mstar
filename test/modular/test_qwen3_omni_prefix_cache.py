@@ -229,11 +229,18 @@ _PROMPTS = {
 }
 
 
+@pytest.mark.parametrize("page_tokens", [128, 1 << 20], ids=["own leading walk", "leading span in the clip's walk"])
 @pytest.mark.parametrize(("modalities", "tensors", "items"), _PROMPTS.values(), ids=_PROMPTS.keys())
-def test_the_layout_lists_each_walk_the_schedule_runs_with_the_slots_it_writes(model, modalities, tensors, items):
+def test_the_layout_lists_each_walk_the_schedule_runs_with_the_slots_it_writes(
+    model, modalities, tensors, items, page_tokens,
+):
+    model.__dict__["_thinker_page_tokens"] = page_tokens
     out = _prompt(model, modalities, tensors)
     layout = out.metadata["kv_layout"][THINKER_KV]["main"].spans
-    signals = {name: [object()] * len(value) for name, value in out.new_input_tensors.items()}
+    # pointers carry their tensor's dims, as the conductor's do
+    signals = {
+        name: [SimpleNamespace(dims=list(t.shape)) for t in value] for name, value in out.new_input_tensors.items()
+    }
 
     schedule = model._build_thinker_prefill_schedule(modalities, signals)
     segments = iter(out.new_input_tensors["text_inputs"])
@@ -243,22 +250,32 @@ def test_the_layout_lists_each_walk_the_schedule_runs_with_the_slots_it_writes(m
         if walk == "prefill_text":
             expected.append(("prefill_text", len(next(segments)), None))
             continue
+        # an audio walk also writes the short leading span before its clip
+        extra = len(next(segments)) if "text_prefix" in entry else 0
         walk, length, advance = next(media)
-        # an audio walk also writes the text span after its clip
-        extra = len(next(segments)) if "text_inputs" in entry else 0
+        # and the text span after it
+        extra += len(next(segments)) if "text_inputs" in entry else 0
         expected.append((walk, length + extra, advance + extra))
     assert [(span.walk, span.length, None if span.kind == "ids" else span.advance) for span in layout] == expected, (
         "the layout disagrees with the walks the schedule runs, so the cache would drop it partway through"
     )
 
 
-def test_an_audio_walks_key_names_the_text_it_prefills(model):
-    """The clip's span also holds the text after it, so the trailing ids join
-    its key: the same clip before other text must not hit those pages."""
+@pytest.mark.parametrize("page_tokens", [128, 1 << 20])
+def test_an_audio_walks_key_names_the_text_it_prefills(model, page_tokens):
+    """The clip's span also holds the text after it, and the leading span
+    when that is shorter than a page, so their ids join its key: the same clip
+    around other text must not hit those pages."""
+    model.__dict__["_thinker_page_tokens"] = page_tokens
     out = _prompt(model, ["audio", "text"], {"audio_inputs": [torch.zeros(16000)]})
     layout = out.metadata["kv_layout"][THINKER_KV]["main"]
-    audio = layout.spans[1]
-    assert audio.kind == "digest" and audio.params == tuple(out.new_input_tensors["text_inputs"][1].tolist())
+    before, after = (t.tolist() for t in out.new_input_tensors["text_inputs"])
+    audio = layout.spans[-1]
+    # a leading span shorter than a page runs in the clip's walk too; its ids
+    # lead the params, after their count
+    joined = len(before) < page_tokens
+    assert len(layout.spans) == (1 if joined else 2)
+    assert audio.kind == "digest" and audio.params == ((len(before), *before) if joined else (0,)) + tuple(after)
     assert layout.keyed_count() == len(layout.spans)
 
 

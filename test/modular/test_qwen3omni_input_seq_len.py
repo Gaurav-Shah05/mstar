@@ -87,3 +87,50 @@ def test_an_audio_walk_with_its_text_matches_the_two_walks_it_replaces():
     clip = [config.thinker.audio_start_token_id, *pads, config.thinker.audio_end_token_id]
     assert alone.input_ids.tolist() == clip
     assert both.input_ids.tolist() == clip + text.tolist()
+
+
+def test_a_leading_span_runs_before_the_clip_as_a_text_walk_would():
+    """The leading span takes the stream's first positions; the clip and the
+    text after it follow, shifted by the span's length."""
+    from types import SimpleNamespace
+
+    from torch import nn
+
+    from mstar.model.qwen3_omni.config import THINKER_POS, Qwen3OmniModelConfig
+    from mstar.model.qwen3_omni.submodules import talker_text_mask
+
+    config = Qwen3OmniModelConfig()
+    thinker = ThinkerSubmodule.__new__(ThinkerSubmodule)
+    nn.Module.__init__(thinker)
+    thinker.config = config
+    ids = (config.thinker.audio_start_token_id, config.thinker.audio_end_token_id,
+           config.im_start_token_id, config.assistant_token_id, config.system_token_id)
+    embed = nn.Embedding(max(config.thinker_text.vocab_size, *ids) + 1, HIDDEN)
+    thinker.model = SimpleNamespace(model=SimpleNamespace(embed_tokens=embed))
+    thinker._audio_bos_embed = thinker._audio_eos_embed = None
+    thinker.__dict__["_cached_device"] = torch.device("cpu")
+    counter = {"pos": 3}
+    thinker.node_resources = {THINKER_POS: SimpleNamespace(position=lambda rid, label: counter["pos"])}
+    audio = torch.randn(10, HIDDEN)
+    # a system turn, then the user turn the clip opens
+    prefix = torch.tensor([config.im_start_token_id, config.system_token_id, 21, 22, config.im_start_token_id, 23])
+    text = torch.tensor([9, 10])
+    info = SimpleNamespace(rid_handle=0)
+
+    both = thinker.prepare_inputs(
+        "prefill_audio", info, {"audio_embeds": [audio], "text_prefix": [prefix], "text_inputs": [text]},
+    )
+    counter["pos"] = 3 + len(prefix)
+    rest = thinker.prepare_inputs("prefill_audio", info, {"audio_embeds": [audio], "text_inputs": [text]})
+
+    p = len(prefix)
+    assert both.input_seq_len == p + rest.input_seq_len
+    assert torch.equal(both.input_embeds[:p], embed(prefix))
+    assert torch.equal(both.input_embeds[p:], rest.input_embeds)
+    leading = torch.arange(3, 3 + p, dtype=both.custom_pos_ids.dtype).expand(3, -1)
+    assert torch.equal(both.custom_pos_ids[:, :p], leading)
+    assert torch.equal(both.custom_pos_ids[:, p:], rest.custom_pos_ids)
+    masks = both.tensor_inputs["masks_for_talker"]
+    assert not masks[0, :p].any() and torch.equal(masks[1, :p], talker_text_mask(prefix, config))
+    assert torch.equal(masks[:, p:], rest.tensor_inputs["masks_for_talker"])
+    assert both.input_ids.tolist() == prefix.tolist() + rest.input_ids.tolist()

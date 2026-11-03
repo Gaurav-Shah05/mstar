@@ -625,10 +625,12 @@ def test_qwen_a_clip_before_another_sends_its_walk_an_empty_text_edge():
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 
     model = Qwen3OmniModel.__new__(Qwen3OmniModel)
-    signals = {"text_inputs": ["t0", "t1"], "audio_features": ["af0", "af1"]}
+    model.__dict__["_thinker_page_tokens"] = 128
+    t0, t1 = SimpleNamespace(dims=[300]), SimpleNamespace(dims=[9])
+    signals = {"text_inputs": [t0, t1], "audio_features": ["af0", "af1"]}
     schedule = Qwen3OmniModel._build_thinker_prefill_schedule(model, ["text", "audio", "audio", "text"], signals)
     assert [walk for walk, _ in schedule] == ["prefill_text", "prefill_audio", "prefill_audio"]
-    assert "text_inputs" not in schedule[1][1] and schedule[2][1]["text_inputs"] == "t1"
+    assert "text_inputs" not in schedule[1][1] and schedule[2][1]["text_inputs"] is t1
 
     def edges(step):
         meta = CurrentForwardConductorMetadata(
@@ -638,8 +640,32 @@ def test_qwen_a_clip_before_another_sends_its_walk_an_empty_text_edge():
         sent = Qwen3OmniModel._get_thinker_prefill_inputs(model, meta, {})
         return {(e.next_node, e.name): e.tensor_info for e in sent}
 
-    assert edges(1) == {("audio_encoder", "audio_features"): ["af0"], ("Thinker", "text_inputs"): []}
-    assert edges(2) == {("audio_encoder", "audio_features"): ["af1"], ("Thinker", "text_inputs"): ["t1"]}
+    assert edges(1) == {
+        ("audio_encoder", "audio_features"): ["af0"], ("Thinker", "text_prefix"): [], ("Thinker", "text_inputs"): [],
+    }
+    assert edges(2) == {
+        ("audio_encoder", "audio_features"): ["af1"], ("Thinker", "text_prefix"): [], ("Thinker", "text_inputs"): [t1],
+    }
+
+
+@pytest.mark.parametrize(("length", "walks"), [
+    (40, ["prefill_audio"]), (127, ["prefill_audio"]), (128, ["prefill_text", "prefill_audio"]),
+])
+def test_qwen_a_leading_span_shorter_than_a_page_runs_in_the_clips_walk(length, walks):
+    """A leading span that seals no KV page of its own runs in the clip's
+    walk, before the clip; one a page long keeps a walk of its own, so its
+    pages stay reusable by other prompts."""
+    from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
+
+    model = Qwen3OmniModel.__new__(Qwen3OmniModel)
+    model.__dict__["_thinker_page_tokens"] = 128
+    t0, t1 = SimpleNamespace(dims=[length]), SimpleNamespace(dims=[9])
+    signals = {"text_inputs": [t0, t1], "audio_features": ["af0"]}
+    schedule = Qwen3OmniModel._build_thinker_prefill_schedule(model, ["text", "audio", "text"], signals)
+    assert [walk for walk, _ in schedule] == walks
+    audio = schedule[-1][1]
+    assert audio["text_inputs"] is t1
+    assert (audio.get("text_prefix") is t0) == (walks == ["prefill_audio"])
 
 
 def test_qwen_placeholder_ids_come_from_the_tokenizer():
