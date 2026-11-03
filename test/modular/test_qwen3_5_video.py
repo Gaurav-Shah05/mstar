@@ -848,7 +848,14 @@ def test_patch_embed_matmul_matches_its_conv():
     torch.testing.assert_close(embed(patches), conv)
 
 
-def test_position_table_resample_matches_bilinear_interpolate():
+@pytest.mark.parametrize("side, grid, atol", [
+    (6, [(1, 4, 8), (3, 10, 6), (2, 4, 8)], 1e-6),
+    # The checkpoints' 48-wide table, at MMMU-like grids and a large one. The
+    # taps' coordinates are float32 (as transformers computes them), ~eps * 47
+    # off the float64 reference's.
+    (48, [(1, 64, 58), (1, 2, 2), (2, 32, 48), (1, 120, 160)], 5e-5),
+])
+def test_position_table_resample_matches_bilinear_interpolate(side, grid, atol):
     # The tower resamples its learned square position table onto each frame's
     # grid by gathering 2x2 taps on the host; that must be the reference's
     # align_corners bilinear interpolate, in merge-block order, per frame.
@@ -856,10 +863,10 @@ def test_position_table_resample_matches_bilinear_interpolate():
 
     from mstar.model.components.qwen3_vit import vision_interpolation
 
-    side, merge, dim = 6, 2, 3
+    merge, dim = 2, 3
     table = torch.randn(side, side, dim, dtype=torch.float64)
-    grid = [(1, 4, 8), (3, 10, 6), (2, 4, 8)]
     indices, weights = vision_interpolation(grid, side, merge)
+    assert indices.dtype == torch.int64 and weights.dtype == torch.float32
     got = (table.reshape(side * side, dim)[indices] * weights[..., None].double()).sum(1)
 
     expected = []
@@ -867,7 +874,7 @@ def test_position_table_resample_matches_bilinear_interpolate():
         frame = F.interpolate(table.permute(2, 0, 1)[None], size=(h, w), mode="bilinear", align_corners=True)
         frame = frame[0].permute(1, 2, 0).reshape(h // merge, merge, w // merge, merge, dim)
         expected.append(frame.permute(0, 2, 1, 3, 4).reshape(h * w, dim).repeat(t, 1))
-    torch.testing.assert_close(got, torch.cat(expected), rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(got, torch.cat(expected), rtol=0, atol=atol)
 
 
 def test_vision_blocks_share_one_compiled_frame():
