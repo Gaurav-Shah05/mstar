@@ -90,6 +90,7 @@ class Qwen3DenseLM(nn.Module):
         kv_key: str,
         pos_key: str,
         comm_group: CommGroup | None = None,
+        attention_cls: type[Qwen3Attention] = Qwen3Attention,
     ):
         super().__init__()
         self.config = config
@@ -101,7 +102,7 @@ class Qwen3DenseLM(nn.Module):
         )
         self.layers = nn.ModuleList([
             DecoderLayer(
-                self_attn=Qwen3Attention(
+                self_attn=attention_cls(
                     comm_group=comm_group,
                     hidden_size=config.num_attention_heads * config.head_dim,
                     num_heads=config.num_attention_heads,
