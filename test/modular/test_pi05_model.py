@@ -337,6 +337,30 @@ def test_discretize_state_round_trip_within_bin():
     assert indices[-1].item() == 255
 
 
+def test_discretize_state_floors_into_openpi_bins():
+    """openpi's np.digitize binning: floor into 2/256-wide bins, -1 below the
+    range and 255 at its top."""
+    state = torch.tensor([-1.5, -1.0, -0.999, 0.0, 0.99, 1.0, 2.0])
+    assert discretize_state(state).tolist() == [-1, 0, 0, 128, 254, 255, 255]
+
+
+def test_pi05_tokenizer_encodes_the_prompt_unchanged():
+    """No lowercasing or stripping: openpi's pi05 prompt keeps its case and
+    the trailing space after "Action:"."""
+    from mstar.model.pi05.components.tokenization import Pi05Tokenizer
+
+    seen = []
+
+    class _HF:
+        def __call__(self, text, add_special_tokens):
+            seen.append((text, add_special_tokens))
+            return type("Out", (), {"input_ids": [2, 5, 6]})()
+
+    ids = Pi05Tokenizer(_HF(), Pi05Config()).encode_prompt("Task: Pick, State: 1;\nAction: ")
+    assert seen == [("Task: Pick, State: 1;\nAction: ", True)]
+    assert ids.tolist() == [2, 5, 6]
+
+
 # ----------------------------------------------------------------------
 # Prompt formatting (matches lerobot's Pi05PrepareStateTokenizerProcessorStep)
 # ----------------------------------------------------------------------
