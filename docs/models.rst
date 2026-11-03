@@ -418,6 +418,8 @@ and the vision encoder node, with the notes in the Qwen3.5 section below
   equal, which makes interleaved MRoPE plain RoPE), through the position
   resource's fused norm, RoPE and KV-write kernel; only a ``prefill_vision``
   step brings 3D rotary tables.
+- The LLM node runs on one GPU: tensor parallelism is refused at load until
+  it is validated.
 - No ``/v1/chat/completions`` route yet: the OpenAI adapters live in the API
   server.
 

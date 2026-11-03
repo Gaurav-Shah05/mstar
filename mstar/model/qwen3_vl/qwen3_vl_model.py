@@ -133,6 +133,12 @@ class Qwen3VLModel(Qwen3_5DenseModel):
             logger.info("Loaded Qwen3-VL vision tower onto %s", device)
             return Qwen3VLVisionEncoderSubmodule(tower, self.vision_config, self.pixel_normalizer())
 
+        if tp_group is not None and tp_group.world_size > 1:
+            raise ValueError(
+                "Qwen3-VL's LLM node runs on one GPU here: tensor parallelism is not validated "
+                "(deepstack and the 3D rotary path were tested on one rank only). Give the LLM "
+                "node a single rank in `node_groups`."
+            )
         model = self._build(lambda: Qwen3VLForCausalLM(self.config, tp_group), dtype, device)
         model.model.load_checkpoint(weights_dir, device=device)
         model.requires_grad_(False).eval()
