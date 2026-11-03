@@ -16,10 +16,11 @@ Graph walks (2):
     prefill    - SigLIP encodes camera images, then PaliGemma prefills the
                  prefix [image_tokens, language_tokens, state_tokens] with
                  bidirectional attention and writes the KV cache.
-    action_gen - 10-iteration flow-matching loop. Each iteration the action
-                 expert reads the frozen prefix KV cache, predicts a velocity
-                 with adaRMS timestep conditioning, and applies one Euler
-                 step. The final iteration emits the denoised action tensor.
+    action_gen - one LLM step running the 10-step flow-matching loop. Each
+                 Euler step the action expert reads the frozen prefix KV
+                 cache, predicts a velocity with adaRMS timestep
+                 conditioning, and updates the actions; the step emits the
+                 denoised action tensor.
 """
 
 import json
@@ -47,7 +48,6 @@ from mstar.graph.base import (
     GraphEdge,
     GraphNode,
     GraphSection,
-    Loop,
     Sequential,
     TensorPointerInfo,
 )
@@ -458,32 +458,18 @@ class Pi05Model(Model):
             ]
         )
 
-        # NOTE: The Loop's terminal ``outputs`` are matched into the section's
-        # node outputs by **name** (see Loop._replace_outputs_for_final_iter
-        # in mstar/graph/base.py): on the final iteration, any section-output
-        # edge whose name matches a terminal output's name is replaced with
-        # the terminal version. This is the same convention BAGEL's image_gen
-        # uses (section returns ``latents`` looping back to LLM, terminal
-        # output is ``name="latents" → vae_decoder``). So our terminal output
-        # MUST be named ``noisy_actions`` to match the section's loop-back
-        # edge — the name is just a graph-internal key, while the actual
-        # client-facing modality bucket is determined by ``output_modality``.
-        action_gen = Loop(
-            section=GraphNode(
-                name="LLM",
-                input_names=["noisy_actions", "timestep_index"],
-                outputs=[
-                    GraphEdge(next_node="LLM", name="noisy_actions"),
-                    GraphEdge(next_node="LLM", name="timestep_index"),
-                ],
-            ),
-            max_iters=self.config.num_flow_steps,
+        # All num_flow_steps Euler steps run inside one LLM step: the prefix KV
+        # and the action tokens' positions are the same for every step, so one
+        # plan serves the whole loop, and a worker step per Euler step would
+        # cost more host time than the step's GPU work.
+        action_gen = GraphNode(
+            name="LLM",
+            input_names=["noisy_actions"],
             outputs=[
                 GraphEdge(
                     next_node=EMIT_TO_CLIENT,
-                    name="noisy_actions",
+                    name="actions",
                     output_modality="action",
-                    persist=True,
                 ),
             ],
         )
@@ -635,12 +621,8 @@ class Pi05Model(Model):
         if metadata.graph_walk == self.PREFILL_WALK:
             metadata.is_prefill = False
             metadata.graph_walk = self.ACTION_GEN_WALK
-            # Inputs for the first action_gen iteration are sampled inside the
-            # LLM submodule's preprocess (Gaussian noise + timestep_index=0).
-            inputs = [
-                GraphEdge(next_node="LLM", name="noisy_actions"),
-                GraphEdge(next_node="LLM", name="timestep_index"),
-            ]
+            # The initial noise is drawn in the LLM submodule's prepare_inputs.
+            inputs = [GraphEdge(next_node="LLM", name="noisy_actions")]
         elif metadata.graph_walk == self.ACTION_GEN_WALK:
             request_done = True
 
