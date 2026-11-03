@@ -583,12 +583,12 @@ class ThinkerSubmodule(ARNodeSubmodule):
         self, inputs: NameToTensorList, start_pos: int, device: torch.device, speaks: bool,
     ) -> ARNodeInputs:
         """A clip between its sentinels, after the prompt's leading span when
-        that runs here and before the text that follows the clip, built in a
-        few launches: the row's ids in one buffer, embedded in one call with
-        the clip's rows then taken from the encoder, and one range of
-        positions, as text and an audio clip both advance all three MRoPE
-        components together. The Talker's masks only for a request that
-        ``speaks``."""
+        that runs here and before the text that follows the clip: the row's
+        ids embedded in one call, the clip's rows then taken from the encoder,
+        and one range of positions. With no image or video in the prompt, HF's
+        ``get_rope_index`` gives text and audio the same running position in
+        all three MRoPE components. The Talker's masks only for a request
+        that ``speaks``."""
         cfg = self.config.thinker
         audio = inputs["audio_embeds"][0].to(device)  # (audio_tokens, hidden)
         prefix = inputs["text_prefix"][0].to(device) if inputs.get("text_prefix") else None
