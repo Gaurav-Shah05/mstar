@@ -732,12 +732,11 @@ def _qwen3_omni_thinker(device: torch.device):
     thinker = ThinkerSubmodule.__new__(ThinkerSubmodule)
     nn.Module.__init__(thinker)
     thinker.config = config
-    ids = (config.thinker.audio_start_token_id, config.thinker.audio_end_token_id,
+    ids = (config.thinker.audio_start_token_id, config.thinker.audio_end_token_id, config.thinker.audio_token_id,
            config.thinker.vision_start_token_id, config.thinker.vision_end_token_id,
            config.im_start_token_id, config.assistant_token_id)
     embed = nn.Embedding(max(config.thinker_text.vocab_size, *ids) + 1, 8, device=device)
     thinker.model = SimpleNamespace(model=SimpleNamespace(embed_tokens=embed))
-    thinker._audio_bos_embed = thinker._audio_eos_embed = None
     thinker._vision_bos_embed = thinker._vision_eos_embed = None
     thinker.__dict__["_cached_device"] = device
     thinker.node_resources = {THINKER_POS: SimpleNamespace(position=lambda rid, label: 5)}
