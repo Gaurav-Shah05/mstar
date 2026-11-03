@@ -10,11 +10,22 @@ node_groups:
 
 # The vision regions compile at start-up; these two sizes (64 and 608 image
 # tokens) warm two of the captured block loop's buckets and the LLM's vision
-# prefill before the server binds.
+# prefill before the server binds. The last two pack 7 and 8 copies of the
+# 608-token image into one prompt (4282 and 4892 tokens, 17024 and 19456
+# patches): past the top of PREFILL_VISION_TOKEN_BUCKETS (4096) and of
+# BLOCK_LOOP_PATCH_BUCKETS (16384), so the uncaptured paths compile here rather
+# than on the first large live request. Two lengths, because Dynamo compiles a
+# first shape static and only a second one dynamic.
 warmup_requests:
   - text: What is in this image?
     files: [hf://nvidia/Cosmos3-Edge/assets/example_action_fd_umi_first_frame.png]
     model_kwargs: {max_output_tokens: 4}
   - text: What is in this image?
-    files: [hf://nvidia/Cosmos3-Edge/assets/edge_action_id_av_0_output.png]
+    files: [&wide hf://nvidia/Cosmos3-Edge/assets/edge_action_id_av_0_output.png]
+    model_kwargs: {max_output_tokens: 4}
+  - text: Describe these images.
+    files: [*wide, *wide, *wide, *wide, *wide, *wide, *wide]
+    model_kwargs: {max_output_tokens: 4}
+  - text: Describe these images.
+    files: [*wide, *wide, *wide, *wide, *wide, *wide, *wide, *wide]
     model_kwargs: {max_output_tokens: 4}
