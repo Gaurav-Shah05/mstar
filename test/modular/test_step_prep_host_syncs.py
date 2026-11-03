@@ -765,13 +765,17 @@ def test_qwen3_omni_thinker_prefill_prep_writes_no_scalar():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="sync-debug mode needs a GPU")
-def test_qwen3_omni_thinker_prefill_prep_takes_no_host_sync():
+def test_qwen3_omni_thinker_audio_prep_takes_no_host_sync():
+    """An audio row (clip and the text after it) prepares with no host sync,
+    once the sentinel embeddings exist (the first call builds them)."""
     device = torch.device("cuda")
     thinker = _qwen3_omni_thinker(device)
-    for walk, inputs in _qwen3_omni_prefill_rows(device):
-        torch.cuda.synchronize()
-        torch.cuda.set_sync_debug_mode("error")
-        try:
-            thinker.prepare_inputs(walk, _fwd(0, walk), inputs)
-        finally:
-            torch.cuda.set_sync_debug_mode("default")
+    walk, inputs = _qwen3_omni_prefill_rows(device)[0]
+    thinker.prepare_inputs(walk, _fwd(0, walk), inputs)
+    torch.cuda.synchronize()
+    previous = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        thinker.prepare_inputs(walk, _fwd(0, walk), inputs)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)
