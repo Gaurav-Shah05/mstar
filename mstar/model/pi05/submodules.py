@@ -188,8 +188,10 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs
     ) -> NodeInputs:
-        return NodeInputs(tensor_inputs={"pixel_values": self._prepare_one(
-            inputs["image_inputs"][0]
+        # One [C, H, W] image per camera, in order; each is letterboxed on its own
+        # since cameras can differ in resolution.
+        return NodeInputs(tensor_inputs={"pixel_values": torch.cat(
+            [self._prepare_one(image) for image in inputs["image_inputs"]]
         )})
 
     def preprocess(
@@ -308,27 +310,11 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         self.action_out_proj = action_out_proj
         self.time_mlp = time_mlp
         self.config = config
-        # Image features and language token embeddings use DIFFERENT scaling
-        # factors in lerobot's reference, even though both end up calling it
-        # ``sqrt(hidden_size)``:
-        #
-        #   * Images: ``embed_image`` returns
-        #     ``connector(siglip_features) * sqrt(hidden_size)``  -> scale = sqrt(H).
-        #
-        #   * Text: lerobot's ``lang_embed_func`` does
-        #     ``embed_language_tokens(tokens) * sqrt(hidden_size)``, but
-        #     ``embed_language_tokens`` calls HF Gemma's
-        #     ``GemmaTextScaledWordEmbedding`` whose ``forward`` already
-        #     multiplies the raw lookup by an internal ``embed_scale =
-        #     sqrt(hidden_size)``. So the EFFECTIVE text scale is
-        #     ``sqrt(H) * sqrt(H) = H``, not ``sqrt(H)``.
-        #
-        # We use a plain ``nn.Embedding`` for ``embed_tokens`` (no internal
-        # scale), so we have to apply the full ``H`` factor manually here.
-        # Mismatching this produces a ~45x undersized text prefix and the
-        # action expert sees a wildly wrong context.
-        self._image_embed_scale = math.sqrt(config.hidden_size)
-        self._text_embed_scale = float(config.hidden_size)
+        # Prefix scaling as openpi's embed_prefix does it
+        # (models_pytorch/pi0_pytorch.py): SigLIP tokens unscaled, language
+        # embeddings times sqrt(hidden_size). openpi's Gemma skips its own
+        # input normalizer, and ``embed_tokens`` here is a plain nn.Embedding.
+        self._text_embed_scale = math.sqrt(config.hidden_size)
 
         # Lazily allocated on first action Euler step, sized for the largest
         # captured batch. sincos_timestep_embedding fully overwrites this buffer
@@ -463,24 +449,10 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         inputs: NameToTensorList,
         **kwargs
     ) -> ARNodeInputs:
-        # Pi0.5 prefix layout (matches lerobot's embed_prefix):
-        #   [image_tokens, language_tokens]
-        # The robot state is *not* a separate token stream — it has already
-        # been formatted as a decimal-string suffix on the language prompt
-        # by ``Pi05Model.process_prompt``, then tokenized by the PaliGemma
-        # tokenizer. So the LLM only consumes ``img_emb`` + ``text_inputs``.
-        #
-        # IMPORTANT: lerobot's ``embed_prefix`` scales BOTH the image features
-        # (after the multi_modal_projector) and the language token embeddings
-        # by ``sqrt(hidden_size)``. We mirror that here. Without the image
-        # scaling the SigLIP tokens come in ~sqrt(2048)≈45x too small relative
-        # to the language tokens and the action expert sees a wildly wrong
-        # prefix. (The standalone test_pi05_model_loaded_via_remapper_matches_
-        # lerobot integration test missed this because it bypasses
-        # _preprocess_prefill and feeds in lerobot's pre-scaled embed_prefix
-        # output directly.)
-
-        img_emb = inputs["img_emb"][0] * self._image_embed_scale
+        # Prefix layout [image_tokens, language_tokens], as openpi's
+        # embed_prefix. The robot state is part of the language tokens:
+        # ``Pi05Model.process_prompt`` writes it into the prompt.
+        img_emb = inputs["img_emb"][0]
         text_ids = inputs["text_inputs"][0]
         text_emb = self._embed_tokens_scaled(text_ids)
         prefix_emb = torch.cat([img_emb, text_emb], dim=0)

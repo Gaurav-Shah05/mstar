@@ -528,6 +528,16 @@ class Pi05Model(Model):
                 }
             return {}
 
+        cfg = self.config
+        # SigLIP is captured for num_cameras images and the prefix KV layout
+        # below reserves their tokens, so a request carries exactly that many.
+        num_images = len((kwargs.get("tensors") or {}).get("image_inputs", ()))
+        if num_images != cfg.num_cameras:
+            raise ValueError(
+                f"Pi0.5 takes exactly {cfg.num_cameras} camera images per request "
+                f"(num_cameras), got {num_images}"
+            )
+
         cleaned = (prompt or "").strip().replace("_", " ").replace("\n", " ")
 
         robot_state = kwargs.get("robot_state")
@@ -546,8 +556,6 @@ class Pi05Model(Model):
             full_prompt = cleaned
 
         text_ids = self.tokenizer.encode_prompt(full_prompt)
-        cfg = self.config
-        # a captured SigLIP step encodes all num_cameras slots, however many images the request has
         images = cfg.num_cameras * (cfg.vit_image_size // cfg.vit_patch_size) ** 2
         layout = LabelLayout(
             spans=(
@@ -563,6 +571,9 @@ class Pi05Model(Model):
         normalizes uint8 on the GPU, so the API server skips a float pass per
         camera and stages a quarter of the bytes for the worker."""
         return TensorAndMetadata(read_image(filepath, rgb=True).to(device))
+
+    def max_input_files(self) -> dict[str, int]:
+        return {"image": self.config.num_cameras}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {LLM_KV: {"main": KVLabel()}}
