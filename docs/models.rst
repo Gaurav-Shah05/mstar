@@ -87,6 +87,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``qwen3_8_27b``
      - ``Qwen/Qwen3.8-27B``
      - Qwen3.8-27B on the Qwen3.5 code above (same architecture); ships a TP4 config.
+   * - ``qwen3_vl_{2,4,8}b``
+     - ``Qwen/Qwen3-VL-{2,4,8}B-Instruct``
+     - Qwen3-VL Instruct (text, image and video in, text out): dense Qwen3 LLM with
+       interleaved 3D MRoPE and deepstack, on Qwen3.5's ViT and prompt handling.
    * - ``omnivoice``
      - ``k2-fsa/OmniVoice``
      - Massively multilingual zero-shot TTS: masked-diffusion canvas over a Qwen3-0.6B
@@ -391,6 +395,31 @@ BAGEL notes
   GPU. A config that places ``LLM_cfg_text`` or ``LLM_cfg_img`` with
   ``graph_walks`` names these walks: ``LLM_cfg_text`` and ``combine_cfg`` both,
   ``LLM_cfg_img`` only ``image_gen_cfg3``.
+
+Qwen3-VL (``qwen3_vl_*``)
+-------------------------
+
+Text, image and video chat on Qwen3-VL-2B, 4B and 8B Instruct, on
+``POST /generate``::
+
+    mstar serve qwen3_vl_8b --gpus 0
+
+Qwen3.5's multimodal front end is Qwen3-VL's, so this model reuses it: the
+chat template, the image and video processors, the interleaved prompt layout
+and the vision encoder node, with the notes in the Qwen3.5 section below
+(encoder capture limits, video sampling, KV sizing for video). What differs:
+
+- The LLM is a dense Qwen3 with no recurrent state, so a request holds only a
+  KV allocation and there is no ``gdn_state`` to size.
+- Deepstack: the vision node also sends the merged hidden states of three of
+  its blocks, which the LLM adds to its first three layers' outputs at the
+  image tokens.
+- Text and decode rows rotate by 1D positions (their three MRoPE grids are
+  equal, which makes interleaved MRoPE plain RoPE), through the position
+  resource's fused norm, RoPE and KV-write kernel; only a ``prefill_vision``
+  step brings 3D rotary tables.
+- No ``/v1/chat/completions`` route yet: the OpenAI adapters live in the API
+  server.
 
 Qwen3.5 / Qwen3.8 (``qwen3_5_*``, ``qwen3_8_27b``)
 --------------------------------------------------

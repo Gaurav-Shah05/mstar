@@ -211,6 +211,17 @@ HF_MODELS.update({
 MODEL_REGISTRY["qwen3_8_27b"] = ("mstar.model.qwen3_5.qwen3_5_model", "Qwen3_5DenseModel")
 HF_MODELS["qwen3_8_27b"] = {"model_path_hf": "Qwen/Qwen3.8-27B"}
 
+# Qwen3-VL family: dense Instruct
+qwen3_vl_sizes = ("2", "4", "8")
+MODEL_REGISTRY.update({
+    f"qwen3_vl_{size}b": ("mstar.model.qwen3_vl.qwen3_vl_model", "Qwen3VLModel")
+    for size in qwen3_vl_sizes
+})
+HF_MODELS.update({
+    f"qwen3_vl_{size}b": {"model_path_hf": f"Qwen/Qwen3-VL-{size}B-Instruct"}
+    for size in qwen3_vl_sizes
+})
+
 
 def model_init_kwargs(name: str) -> dict:
     """Constructor kwargs the registry pins for ``name``: the checkpoint repo
