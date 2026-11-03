@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -87,28 +88,30 @@ def vision_position_ids(
 
 
 def _axis_taps_weights(
-    index: torch.Tensor, size: int, side: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    index: np.ndarray, size: int, side: int,
+) -> tuple[np.ndarray, np.ndarray]:
     """Bilinear taps into a ``side``-long table, for positions on an axis of
     length ``size``. ``align_corners=True`` and border padding, matching the
     ``F.interpolate`` call upstream reproduces."""
-    index = index.to(torch.float32)
-    # closed form of `linspace(0, side - 1, size)[index]`; the max avoids a
-    # divide-by-zero at size == 1, where index is 0 anyway
-    src = index * (side - 1) / max(size - 1, 1)
-    floor = torch.floor(src)
-    offsets = torch.arange(0, 2, device=index.device)
-    taps = (floor.long()[:, None] + offsets).clamp(0, side - 1)
-    distance = (src[:, None] - floor[:, None] - offsets).abs()
-    return taps, (1 - distance).clamp(min=0)
+    # closed form of `linspace(0, side - 1, size)[index]` in float32; the max
+    # avoids a divide-by-zero at size == 1, where index is 0 anyway
+    src = index.astype(np.float32) * np.float32(side - 1) / np.float32(max(size - 1, 1))
+    floor = np.floor(src)
+    offsets = np.arange(2)
+    taps = np.clip(floor.astype(np.int64)[:, None] + offsets, 0, side - 1)
+    # float32 as torch keeps it; numpy would promote float32 - int64 to float64
+    distance = np.abs(src[:, None] - floor[:, None] - offsets.astype(np.float32))
+    return taps, np.maximum(np.float32(1) - distance, np.float32(0))
 
 
 def _frame_interpolation(
     h: int, w: int, side: int, merge: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``[h * w, 4]`` gather indices and weights for one ``(h, w)`` frame, in
-    spatial-merge-block order."""
-    within = torch.arange(h * w)
+    spatial-merge-block order. In numpy, on the calling thread, for the reason
+    ``_tile_frames`` gives: torch splits the larger frames' ops over the intra-op
+    pool."""
+    within = np.arange(h * w)
     # undo the spatial-merge-block ordering to recover (row, col)
     in_col = within % merge
     in_row = (within // merge) % merge
@@ -121,7 +124,7 @@ def _frame_interpolation(
     w_taps, w_w = _axis_taps_weights(col, w, side)
     indices = (h_taps[:, :, None] * side + w_taps[:, None, :]).reshape(-1, 4)
     weights = (h_w[:, :, None] * w_w[:, None, :]).reshape(-1, 4)
-    return indices, weights
+    return torch.from_numpy(indices), torch.from_numpy(weights)
 
 
 def vision_interpolation(
