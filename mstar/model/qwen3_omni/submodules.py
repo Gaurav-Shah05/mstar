@@ -31,7 +31,6 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
     PiecewisePackedConfig,
-    decode_rows_then_prompt,
 )
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
@@ -927,7 +926,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
     # A deployment sets its own with `model_kwargs.prefill_token_buckets`
     # (configs/qwen3omni_2gpu_large_kv.yaml runs it to 8192).
     PREFILL_TOKEN_BUCKETS = [128, 256, 512, 1024, 2048]
-    # prefill and mixed steps alike; a mixed step's decode rows count as rows
+    # past 4 for thinker_mixed, whose decode rows ride in these captures
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 
     # prefill_vision buckets are larger than text/audio because video
@@ -941,25 +940,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[AcceleratorGraphConfig]:
         vision_input = functools.partial(self._vision_capture_input, device)
-        # text rows, so padded text and mixed steps keep the broadcast
-        # positions; an audio row brings its own
-        def text_input(n: int) -> ARNodeInputs:
-            return ARNodeInputs(
-                input_seq_len=n,
-                input_ids=torch.zeros((n,), dtype=torch.long, device=device),
-                input_embeds=torch.zeros(
-                    (n, self.config.thinker_hidden_size),
-                    device=device, dtype=torch.bfloat16
-                ),
-                tensor_inputs={
-                    "masks_for_talker": torch.zeros(
-                        (2, n),
-                        dtype=torch.float,
-                        device=device,
-                    ),
-                }
-            )
-
         return [
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk="thinker_decode",
@@ -972,19 +952,26 @@ class ThinkerSubmodule(ARNodeSubmodule):
             ),
             PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill_text",
-                replay_graph_walks=["prefill_text", "prefill_audio"],
-                make_node_input=text_input,
+                replay_graph_walks=["prefill_text", "prefill_audio", THINKER_MIXED],
+                # text rows, so padded text and mixed steps keep the broadcast
+                # positions; an audio row brings its own
+                make_node_input=lambda n: ARNodeInputs(
+                    input_seq_len=n,
+                    input_ids=torch.zeros((n,), dtype=torch.long, device=device),
+                    input_embeds=torch.zeros(
+                        (n, self.config.thinker_hidden_size),
+                        device=device, dtype=torch.bfloat16
+                    ),
+                    tensor_inputs={
+                        "masks_for_talker": torch.zeros(
+                            (2, n),
+                            dtype=torch.float,
+                            device=device,
+                        ),
+                    }
+                ),
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
                 capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
-            ),
-            # the attention's split runs the leading one-token rows on the
-            # decode kernel, so this captures that layout
-            PackedAcceleratorGraphConfig(
-                capture_graph_walk=THINKER_MIXED,
-                make_node_input=text_input,
-                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
-                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
-                token_layout=decode_rows_then_prompt,
             ),
             # any step holding a vision row: the packed forward plus deepstack
             PackedAcceleratorGraphConfig(
