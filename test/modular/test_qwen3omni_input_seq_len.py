@@ -67,7 +67,7 @@ def test_an_audio_walk_with_its_text_matches_the_two_walks_it_replaces():
     thinker.node_resources = {THINKER_POS: SimpleNamespace(position=lambda rid, label: start)}
     audio = torch.randn(10, HIDDEN)
     text = torch.tensor([9, config.im_start_token_id, config.assistant_token_id, 11])
-    info = SimpleNamespace(rid_handle=0)
+    info = SimpleNamespace(rid_handle=0, step_metadata={"audio_output": True})
 
     alone = thinker.prepare_inputs("prefill_audio", info, {"audio_embeds": [audio]})
     both = thinker.prepare_inputs("prefill_audio", info, {"audio_embeds": [audio], "text_inputs": [text]})
@@ -115,7 +115,7 @@ def test_a_leading_span_runs_before_the_clip_as_a_text_walk_would():
     # a system turn, then the user turn the clip opens
     prefix = torch.tensor([config.im_start_token_id, config.system_token_id, 21, 22, config.im_start_token_id, 23])
     text = torch.tensor([9, 10])
-    info = SimpleNamespace(rid_handle=0)
+    info = SimpleNamespace(rid_handle=0, step_metadata={"audio_output": True})
 
     both = thinker.prepare_inputs(
         "prefill_audio", info, {"audio_embeds": [audio], "text_prefix": [prefix], "text_inputs": [text]},
@@ -134,3 +134,38 @@ def test_a_leading_span_runs_before_the_clip_as_a_text_walk_would():
     assert not masks[0, :p].any() and torch.equal(masks[1, :p], talker_text_mask(prefix, config))
     assert torch.equal(masks[:, p:], rest.tensor_inputs["masks_for_talker"])
     assert both.input_ids.tolist() == prefix.tolist() + rest.input_ids.tolist()
+
+
+@pytest.mark.parametrize("walk", ["prefill_text", "prefill_audio"])
+def test_a_text_only_request_builds_no_talker_masks(walk):
+    """Only a request that speaks feeds the Talker, so only its rows carry the
+    Talker's masks; the rest of the row is the same either way."""
+    from types import SimpleNamespace
+
+    from torch import nn
+
+    from mstar.model.qwen3_omni.config import THINKER_POS, Qwen3OmniModelConfig
+
+    config = Qwen3OmniModelConfig()
+    thinker = ThinkerSubmodule.__new__(ThinkerSubmodule)
+    nn.Module.__init__(thinker)
+    thinker.config = config
+    ids = (config.thinker.audio_start_token_id, config.thinker.audio_end_token_id,
+           config.im_start_token_id, config.assistant_token_id)
+    thinker.model = SimpleNamespace(model=SimpleNamespace(embed_tokens=nn.Embedding(max(*ids) + 1, HIDDEN)))
+    thinker._audio_bos_embed = thinker._audio_eos_embed = None
+    thinker.__dict__["_cached_device"] = torch.device("cpu")
+    thinker.node_resources = {THINKER_POS: SimpleNamespace(position=lambda rid, label: 2)}
+    text = torch.tensor([9, config.im_start_token_id, config.assistant_token_id])
+    inputs = {"text_inputs": [text]} if walk == "prefill_text" else {"audio_embeds": [torch.randn(6, HIDDEN)],
+                                                                     "text_inputs": [text]}
+
+    def prepare(speaks):
+        info = SimpleNamespace(rid_handle=0, step_metadata={"audio_output": speaks})
+        return thinker.prepare_inputs(walk, info, inputs)
+
+    speaking, silent = prepare(True), prepare(False)
+    assert "masks_for_talker" in speaking.tensor_inputs and "masks_for_talker" not in silent.tensor_inputs
+    assert torch.equal(speaking.input_embeds, silent.input_embeds) and torch.equal(speaking.input_ids, silent.input_ids)
+    cut = thinker.split_inputs(walk, None, silent, 1, silent.input_seq_len)
+    assert "masks_for_talker" not in cut.tensor_inputs
