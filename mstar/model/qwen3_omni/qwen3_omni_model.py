@@ -381,13 +381,28 @@ class Qwen3OmniModel(Model):
         """Whether a leading span of ``length`` tokens runs in the clip's walk
         after it: when it is shorter than a page of the Thinker's KV, as the
         model declares it. Such a span seals no page of its own, so no other
-        prompt could reuse it from the prefix cache."""
+        prompt could reuse it from the prefix cache. The API server never sees
+        the deployment's ``resources:``, so a smaller ``page_size`` there is
+        not seen here (`validate_config_yaml` warns of it)."""
         page = self.__dict__.get("_thinker_page_tokens")
         if page is None:
             page = self.__dict__["_thinker_page_tokens"] = next(
                 spec.config.tokens_per_page for spec in self.get_node_resources() if spec.resource_key == THINKER_KV
             )
         return length < page
+
+    def validate_config_yaml(self, config: dict, config_path: str) -> None:
+        """Warn when the deployment pages the Thinker's KV finer than the model
+        declares: a leading span of that page size or more, but shorter than
+        the declared page, then runs in its clip's walk and is keyed with the
+        clip, so other prompts cannot reuse those pages."""
+        page = ((config.get("resources") or {}).get(THINKER_KV) or {}).get("page_size")
+        if page is not None and self._prefix_joins_audio(int(page)):
+            logger.warning(
+                "%s: %s page_size %s is below the declared page; leading prompt spans of %s tokens or more but "
+                "shorter than the declared page are prefilled with the audio clip after them and are not "
+                "reused across prompts with other clips", config_path, THINKER_KV, page, page,
+            )
 
     def get_request_resource_configs(
         self, partition_fwd_args: dict[str, ForwardPassArgs],
@@ -811,7 +826,7 @@ class Qwen3OmniModel(Model):
         """Build initial ForwardPassArgs for the Thinker partition.
 
         Constructs a prefill schedule from the input modalities, then
-        begins the first walk in that schedule (always prefill_text).
+        begins the first walk in that schedule.
         """
         audio_output = "audio" in output_modalities
 
@@ -1411,6 +1426,8 @@ class Qwen3OmniModel(Model):
             if leads_audio(plan, i) and self._prefix_joins_audio(len(tensors["text_inputs"][step.index])):
                 ids = tensors["text_inputs"][step.index]
                 prefix, prefix_kept = tuple(ids.tolist()), int(talker_text_mask(ids, self.config).sum())
+                # it takes a text_inputs entry without being an ids span
+                merged = True
                 position += len(ids)
                 continue
             if follows_audio(plan, i):

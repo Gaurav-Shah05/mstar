@@ -279,6 +279,24 @@ def test_an_audio_walks_key_names_the_text_it_prefills(model, page_tokens):
     assert layout.keyed_count() == len(layout.spans)
 
 
+@pytest.mark.parametrize("page_tokens", [128, 1 << 20])
+def test_keys_stop_after_a_leading_span_the_clips_walk_takes(model, page_tokens):
+    """A leading span folded into the clip's walk takes a text_inputs entry
+    without being an ids span too, even with no text right after the clip."""
+    model.__dict__["_thinker_page_tokens"] = page_tokens
+    out = _prompt(
+        model, ["text", "audio", "image", "text"],
+        {"audio_inputs": [torch.zeros(16000)], "image_inputs": [torch.rand(3, 64, 96)]},
+    )
+    layout = out.metadata["kv_layout"][THINKER_KV]["main"]
+    walks = [span.walk for span in layout.spans]
+    if len(out.new_input_tensors["text_inputs"][0]) < page_tokens:
+        assert walks == ["prefill_audio", "prefill_vision", "prefill_text"] and layout.keyed_count() == 2
+    else:
+        assert walks == ["prefill_text", "prefill_audio", "prefill_vision", "prefill_text"]
+        assert layout.keyed_count() == 4
+
+
 def test_keys_stop_at_the_first_ids_span_after_an_audio_walk(model):
     """The data worker keys each ids span by the next text_inputs entry, and an
     audio walk's span takes one of them without being an ids span."""
