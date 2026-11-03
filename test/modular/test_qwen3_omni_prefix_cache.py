@@ -65,7 +65,7 @@ def thinker():
 
 
 def _prepare(thinker, walk: str, inputs: dict, held: CachedPrefix | None = None, rid: str = RID):
-    info = SimpleNamespace(rid_handle=rid, step_metadata={"audio_output": True})
+    info = SimpleNamespace(rid_handle=rid)
     prepared = thinker.prepare_inputs(walk, info, inputs)
     if held is None:
         return prepared
