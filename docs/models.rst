@@ -415,9 +415,10 @@ and the vision encoder node, with the notes in the Qwen3.5 section below
   its blocks, which the LLM adds to its first three layers' outputs at the
   image tokens.
 - Text and decode rows rotate by 1D positions (their three MRoPE grids are
-  equal, which makes interleaved MRoPE plain RoPE), through the position
-  resource's fused norm, RoPE and KV-write kernel; only a ``prefill_vision``
-  step brings 3D rotary tables.
+  equal, which makes interleaved MRoPE plain RoPE): on CUDA, the attention
+  resource's fused q/k-norm, RoPE and KV-write kernel at the position
+  resource's planned positions. Only a ``prefill_vision`` step brings 3D
+  rotary tables.
 - The LLM node runs on one GPU: tensor parallelism is refused at load until
   it is validated.
 - No ``/v1/chat/completions`` route yet: the OpenAI adapters live in the API
