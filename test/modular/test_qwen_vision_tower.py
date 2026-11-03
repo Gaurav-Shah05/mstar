@@ -40,7 +40,10 @@ def _towers(deepstack: tuple[int, ...], dtype: torch.dtype = torch.float32):
     with torch.no_grad():
         for param in reference.parameters():
             param.normal_(0, 0.2)
+    inv_freq = reference.rotary_pos_emb.inv_freq.clone()
     reference = reference.to(dtype)
+    # as `from_pretrained(dtype=...)` leaves it: the rotary frequencies stay fp32
+    reference.rotary_pos_emb.inv_freq = inv_freq
     ours = QwenVisionModel(QwenVisionConfig(deepstack_visual_indexes=deepstack, **SIZES))
     missing, unexpected = ours.load_state_dict(reference.state_dict(), strict=False)
     assert not unexpected and not missing, (missing, unexpected)

@@ -120,7 +120,11 @@ class FrameSDPA:
 
 class QwenVisionModel(nn.Module):
     """The rotary tables go into the blocks fp32, as transformers keeps them (Qwen3.5's
-    and Qwen3-Omni's towers round them to the activations' dtype)."""
+    and Qwen3-Omni's towers round them to the activations' dtype).
+
+    ``forward`` is ``embed``, ``encode`` (the block loop, with the deepstack blocks'
+    hidden states) and ``merge`` in a row; a node that captures the block loop on its
+    own runs them separately."""
 
     def __init__(self, config: QwenVisionConfig, attn_key: str = VISION_ATTN):
         super().__init__()
@@ -135,16 +139,25 @@ class QwenVisionModel(nn.Module):
             VisionPatchMerger(config, postshuffle_norm=True) for _ in self.deepstack_visual_indexes
         )
 
-    def forward(
+    def _apply(self, fn, recurse=True):
+        """Keep the rotary frequencies fp32 through a cast to bf16 (the engine casts
+        every submodule to its node's dtype), as transformers does: rounded, the far
+        patches of a large image rotate by visibly wrong angles."""
+        out = super()._apply(fn, recurse)
+        rotary = self.rotary_pos_emb
+        if rotary.inv_freq.dtype != torch.float32 and rotary.inv_freq.device.type != "meta":
+            rotary.inv_freq = VisionRotaryEmbedding(self.config).inv_freq.to(rotary.inv_freq.device)
+        return out
+
+    def embed(
         self,
         pixel_values: torch.Tensor,
         indices: torch.Tensor,
         weights: torch.Tensor,
         position_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """``[total_patches, patch_numel]`` in; ``[merged_tokens, out_hidden]`` and one such
-        tensor per deepstack merger out (``Qwen3VLVisionModel.forward``). Grid-derived inputs
-        come from the caller (``qwen3_vit``'s grid helpers), so the tower has no host reads."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Patch embed plus the resampled position table, and the fp32 rotary tables
+        for the blocks: everything before the block loop, per patch."""
         n = pixel_values.shape[0]
         # one symbol for every leading dim, not one each
         torch._check(indices.shape[0] == n)
@@ -156,11 +169,37 @@ class QwenVisionModel(nn.Module):
         pos = (self.pos_embed(indices) * weights[:, :, None]).sum(1)
         hidden = hidden + pos.to(hidden.dtype)
         cos, sin = self.rotary_pos_emb(position_ids)
+        return hidden, cos, sin
 
-        features = []
+    def encode(
+        self, hidden: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """The block loop, ``[patches, hidden]`` in and out, with the unmerged hidden
+        states after each deepstack block, in block order."""
+        taps = []
         for index, block in enumerate(self.blocks):
             hidden = block(hidden, cos, sin)
             if index in self.deepstack_visual_indexes:
-                merger = self.deepstack_merger_list[self.deepstack_visual_indexes.index(index)]
-                features.append(merger(hidden))
-        return self.merger(hidden), features
+                taps.append(hidden)
+        return hidden, taps
+
+    def merge(
+        self, hidden: torch.Tensor, taps: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """The merged embeddings, and each tap through the merger its block is listed
+        with in ``deepstack_visual_indexes`` (in block order, as transformers does)."""
+        order = sorted(self.deepstack_visual_indexes)
+        mergers = [self.deepstack_merger_list[self.deepstack_visual_indexes.index(i)] for i in order]
+        return self.merger(hidden), [merger(tap) for merger, tap in zip(mergers, taps, strict=True)]
+
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        indices: torch.Tensor,
+        weights: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """``[total_patches, patch_numel]`` in; ``[merged_tokens, out_hidden]`` and one such
+        tensor per deepstack merger out (``Qwen3VLVisionModel.forward``). Grid-derived inputs
+        come from the caller (``qwen3_vit``'s grid helpers), so the tower has no host reads."""
+        return self.merge(*self.encode(*self.embed(pixel_values, indices, weights, position_ids)))
