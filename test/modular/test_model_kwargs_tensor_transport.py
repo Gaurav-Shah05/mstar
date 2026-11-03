@@ -89,6 +89,17 @@ def _case(name, convert):
     return model, kwargs, tensors
 
 
+def _pi05_cameras(tmp_path, n):
+    from torchvision.io import write_png
+
+    paths = []
+    for i in range(n):
+        path = tmp_path / f"camera{i}.png"
+        write_png(torch.full((3, 8, 8), 40 * i, dtype=torch.uint8), str(path))
+        paths.append(str(path))
+    return paths
+
+
 @pytest.mark.parametrize("case", ["ac", "extrinsics", "masked", "mpc", "pi05", "cosmos"])
 @pytest.mark.parametrize("representation", [
     "cpu", "cuda", "noncontiguous-cpu", "noncontiguous-cuda", "list", "numpy",
@@ -119,7 +130,9 @@ def test_model_kwargs_reach_workers_through_preprocessing_and_shm(
         communicator=communicator, tensor_manager=sender, model=model,
     )
     try:
-        worker._process_input(PreprocessInput("r", "Pick up the cup", None, [], ["video"], kwargs))
+        # pi05 takes exactly num_cameras images per request
+        files = {"image": _pi05_cameras(tmp_path, model.config.num_cameras)} if case == "pi05" else None
+        worker._process_input(PreprocessInput("r", "Pick up the cup", files, [], ["video"], kwargs))
         request = next(msg.body for entity, msg in communicator.sent if entity == "conductor")
         for name, value in original_kwargs.items():
             assert kwargs[name] is value
