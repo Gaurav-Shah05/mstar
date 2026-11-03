@@ -59,19 +59,27 @@ class Qwen3VLTextModel(Qwen3DenseLM):
         self.rope_tables = RopeCache()
         for layer in self.layers:
             layer.self_attn.rope_tables = self.rope_tables
-        # Not a buffer, so the engine's cast to the node's dtype leaves it
-        # fp32, as transformers keeps it
-        self._inv_freq = compute_inv_freq(config.head_dim, config.rope_theta)
+        self.register_buffer(
+            "inv_freq", compute_inv_freq(config.head_dim, config.rope_theta), persistent=False,
+        )
+
+    def _apply(self, fn, recurse=True):
+        """Keep the rotary frequencies fp32 through the engine's cast to the
+        node's dtype, as transformers keeps them."""
+        out = super()._apply(fn, recurse)
+        if self.inv_freq.dtype != torch.float32 and self.inv_freq.device.type != "meta":
+            self.inv_freq = compute_inv_freq(
+                self.config.head_dim, self.config.rope_theta, device=self.inv_freq.device,
+            )
+        return out
 
     def build_cos_sin(
         self, position_ids_3d: torch.Tensor, dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """cos/sin for ``[3, tokens]`` positions, computed in fp32 and rounded
         to ``dtype`` as transformers does."""
-        if self._inv_freq.device != position_ids_3d.device:
-            self._inv_freq = self._inv_freq.to(position_ids_3d.device)
         return compute_3d_cos_sin(
-            position_ids_3d, self._inv_freq, list(self.config.mrope_section), target_dtype=dtype,
+            position_ids_3d, self.inv_freq, list(self.config.mrope_section), target_dtype=dtype,
         )
 
     def forward(
@@ -98,8 +106,7 @@ class Qwen3VLTextModel(Qwen3DenseLM):
             next_norm = layers[i + 1].input_layernorm if i + 1 < len(layers) else self.norm
             h, residual = layer.forward_mlp_residual(h, residual, next_norm)
             if i < deepstack.shape[0]:
-                # after the layer's output is complete, as transformers adds it;
-                # `residual` is the full stream, so this holds under TP too
+                # after the layer's output is complete, as transformers adds it
                 residual = residual + deepstack[i]
                 h = next_norm(residual)
         return h
