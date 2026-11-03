@@ -57,7 +57,6 @@ from mstar.model.qwen3_omni.components.code2wav import Qwen3OmniMoeCode2Wav
 from mstar.model.qwen3_omni.components.rope import (
     compute_3d_cos_sin,
     compute_rope_freqs,
-    get_rope_index_audio,
     get_rope_index_text,
     get_rope_index_vision,
 )
@@ -408,9 +407,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
         # Pre-compute inverse frequencies for 3D MRoPE
         self._inv_freq: torch.Tensor | None = None
 
-        self._audio_bos_embed: torch.Tensor | None = None
-        self._audio_eos_embed: torch.Tensor | None = None
-
         self._vision_bos_embed: torch.Tensor | None = None
         self._vision_eos_embed: torch.Tensor | None = None
 
@@ -423,29 +419,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 device=device,
             )
         return self._inv_freq
-
-    def _wrap_audio_input(self, audio_embeds: torch.Tensor):
-        # Wrap the audio span in ``<|audio_bos|>`` / ``<|audio_eos|>``
-        # sentinel token embeddings so the Thinker sees the same
-        # prompt layout the HF processor produces.
-        device = self.get_device()
-        if self._audio_bos_embed is None or self._audio_eos_embed is None:
-            audio_start_id = self.config.thinker.audio_start_token_id
-            audio_end_id = self.config.thinker.audio_end_token_id
-            start_tok = torch.tensor(
-                [audio_start_id], dtype=torch.long, device=device
-            )
-            end_tok = torch.tensor(
-                [audio_end_id], dtype=torch.long, device=device
-            )
-            self._audio_bos_embed = self.model.model.embed_tokens(start_tok)
-            self._audio_eos_embed = self.model.model.embed_tokens(end_tok)
-
-        return torch.cat([
-            self._audio_bos_embed,
-            audio_embeds,
-            self._audio_eos_embed
-        ], dim=0)
 
     def _wrap_vision_input(self, vision_embeds: torch.Tensor):
         # Wrap the vision span in ``<|vision_bos|>`` / ``<|vision_eos|>``
@@ -534,7 +507,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             rid=fwd_info.rid_handle, label="main"
         )
         if graph_walk == "prefill_audio":
-            return self._audio_inputs(inputs, start_pos, device)
+            return self._audio_inputs(inputs, start_pos, device, fwd_info.step_metadata.get("audio_output", True))
 
         if graph_walk == "prefill_vision":
             vision_embeds = inputs["vision_embeds"][0].to(device)
@@ -606,56 +579,54 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 }
             )
 
-    def _audio_inputs(self, inputs: NameToTensorList, start_pos: int, device: torch.device) -> ARNodeInputs:
+    def _audio_inputs(
+        self, inputs: NameToTensorList, start_pos: int, device: torch.device, speaks: bool,
+    ) -> ARNodeInputs:
         """A clip between its sentinels, after the prompt's leading span when
-        that runs here and before the text that follows the clip. Text rows
-        take text positions, the same in all three components, as a text
-        walk would place them; the clip's are linear too."""
-        audio_embeds = inputs["audio_embeds"][0].to(device)  # (audio_tokens, hidden)
-        audio_len = audio_embeds.shape[0]
-        embeds, masks, pos, ids = [], [], [], []
-        at = start_pos
-
-        def text(text_ids: torch.Tensor) -> None:
-            nonlocal at
-            n = text_ids.shape[0]
-            embeds.append(self.model.model.embed_tokens(text_ids))
-            masks.append(torch.stack([
-                torch.zeros(text_ids.shape, dtype=torch.bool, device=device),
-                talker_text_mask(text_ids, self.config),
-            ]))
-            pos.append(get_rope_index_text(n, at, device))
-            ids.append(text_ids)
-            at += n
-
-        prefix = inputs.get("text_prefix")
-        if prefix:
-            text(prefix[0].to(device))
-        # The sentinels are set with fill_ on a view: a Python scalar written
-        # by index is copied from the host, which waits for the step in flight.
-        mm_mask = torch.ones(audio_len + 2, dtype=torch.bool, device=device)
-        mm_mask[0].fill_(False)
-        mm_mask[-1].fill_(False)
-        masks.append(torch.stack([mm_mask, ~mm_mask]))
-        embeds.append(self._wrap_audio_input(audio_embeds))
-        pos.append(get_rope_index_audio(audio_len + 2, at, device, self.config.thinker.position_id_per_seconds))
-        # the prompt's ids for the clip, as HF's input_ids hold them, so the
-        # sampler tracks this walk's tokens however it is cut or cached
-        clip_ids = torch.full((audio_len + 2,), self.config.thinker.audio_token_id, dtype=torch.long, device=device)
-        clip_ids[0].fill_(self.config.thinker.audio_start_token_id)
-        clip_ids[-1].fill_(self.config.thinker.audio_end_token_id)
-        ids.append(clip_ids)
-        at += audio_len + 2
-        suffix = inputs.get("text_inputs")
-        if suffix:
-            text(suffix[0].to(device))
-        embeds = torch.cat(embeds) if len(embeds) > 1 else embeds[0]
+        that runs here and before the text that follows the clip, built in a
+        few launches: the row's ids in one buffer, embedded in one call with
+        the clip's rows then taken from the encoder, and one range of
+        positions, as text and an audio clip both advance all three MRoPE
+        components together. The Talker's masks only for a request that
+        ``speaks``."""
+        cfg = self.config.thinker
+        audio = inputs["audio_embeds"][0].to(device)  # (audio_tokens, hidden)
+        prefix = inputs["text_prefix"][0].to(device) if inputs.get("text_prefix") else None
+        suffix = inputs["text_inputs"][0].to(device) if inputs.get("text_inputs") else None
+        p = 0 if prefix is None else prefix.shape[0]
+        clip = audio.shape[0] + 2
+        n = p + clip + (0 if suffix is None else suffix.shape[0])
+        # the prompt's ids, as HF's input_ids hold them, so the sampler tracks
+        # this walk's tokens however it is cut or cached. Slots are set with
+        # fill_ and copy_: a Python scalar written by index is copied from the
+        # host, which waits for the step in flight.
+        ids = torch.full((n,), cfg.audio_token_id, dtype=torch.long, device=device)
+        ids[p].fill_(cfg.audio_start_token_id)
+        ids[p + clip - 1].fill_(cfg.audio_end_token_id)
+        if prefix is not None:
+            ids[:p].copy_(prefix)
+        if suffix is not None:
+            ids[p + clip:].copy_(suffix)
+        embeds = self.model.model.embed_tokens(ids)
+        embeds[p + 1:p + clip - 1].copy_(audio)
+        tensor_inputs = {}
+        if speaks:
+            # row 0 marks the clip's rows (the Talker takes their layer-N
+            # states), row 1 the rows it keeps of the text and sentinels
+            masks = torch.zeros((2, n), dtype=torch.bool, device=device)
+            masks[0, p + 1:p + clip - 1].fill_(True)
+            masks[1, p:p + clip].copy_(~masks[0, p:p + clip])
+            if prefix is not None:
+                masks[1, :p].copy_(talker_text_mask(prefix, self.config))
+            if suffix is not None:
+                masks[1, p + clip:].copy_(talker_text_mask(suffix, self.config))
+            tensor_inputs["masks_for_talker"] = masks
         return ARNodeInputs(
-            input_seq_len=embeds.shape[0],
+            input_seq_len=n,
             input_embeds=embeds,
-            input_ids=torch.cat(ids) if len(ids) > 1 else ids[0],
-            custom_pos_ids=torch.cat(pos, dim=1) if len(pos) > 1 else pos[0],
-            tensor_inputs={"masks_for_talker": torch.cat(masks, dim=1) if len(masks) > 1 else masks[0]},
+            input_ids=ids,
+            custom_pos_ids=(torch.arange(n, dtype=torch.float, device=device) + float(start_pos)).expand(3, -1),
+            tensor_inputs=tensor_inputs,
         )
 
     MAX_BATCH_TOKENS = 1024
@@ -674,7 +645,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
         if unknown:
             raise NotImplementedError(f"Thinker cannot cut tensor inputs {sorted(unknown)}")
         cut = super().split_inputs(graph_walk, fwd_info, replace(inputs, tensor_inputs={}), start, end)
-        cut.tensor_inputs = {"masks_for_talker": tensors["masks_for_talker"][:, start:end]}
+        cut.tensor_inputs = {}
+        if "masks_for_talker" in tensors:
+            cut.tensor_inputs["masks_for_talker"] = tensors["masks_for_talker"][:, start:end]
         if graph_walk == "prefill_vision":
             cut.tensor_inputs["deepstack"] = [layer[start:end] for layer in tensors["deepstack"]]
             cut.tensor_inputs["mrope_pos_advance"] = tensors["mrope_pos_advance"]
