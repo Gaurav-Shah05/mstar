@@ -8,7 +8,6 @@ state), and the vision tower's deepstack features carried to the LLM.
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import Any
 
 import torch
@@ -23,33 +22,11 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.components.qwen_vision import QwenVisionConfig, QwenVisionModel
 from mstar.model.qwen3_5.config import ATTN, KV_CACHE, ROPE, SAMPLER
-from mstar.model.qwen3_5.qwen3_5_model import _MIXED_SPLIT, Qwen3_5DenseModel
+from mstar.model.qwen3_5.qwen3_5_model import _MIXED_SPLIT, Qwen3_5DenseModel, _resolve_model_metadata
 from mstar.model.qwen3_vl.config import Qwen3VLConfig
 from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
-
-# what the API and conductor processes need; workers fetch the full snapshot
-_METADATA_FILES = [
-    "config.json",
-    "preprocessor_config.json",
-    "video_preprocessor_config.json",
-    "tokenizer_config.json",
-    "vocab.json",
-    "tokenizer.json",
-    "merges.txt",
-    # Qwen3-VL ships its chat template on its own
-    "chat_template.json",
-]
-
-
-def _resolve_model_metadata(repo_id: str, cache_dir: str | None) -> str:
-    if Path(repo_id).is_dir():
-        return repo_id
-    from huggingface_hub import snapshot_download
-
-    return snapshot_download(repo_id=repo_id, cache_dir=cache_dir, allow_patterns=_METADATA_FILES)
-
 
 class Qwen3VLModel(Qwen3_5DenseModel):
     def __init__(
