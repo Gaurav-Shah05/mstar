@@ -99,6 +99,11 @@ logger = logging.getLogger(__name__)
 VISION_BLOCK_LOOP = "vision_block_loop"
 
 
+def _speaks(fwd_info: CurrentForwardPassInfo) -> bool:
+    """Whether the request asked for audio, so the Thinker feeds the Talker."""
+    return fwd_info.step_metadata.get("audio_output", True)
+
+
 def talker_text_mask(input_ids: torch.Tensor, config: Qwen3OmniModelConfig) -> torch.Tensor:
     """
     Cut system prompt and previous assistant parts out of the talker input.
@@ -516,17 +521,17 @@ class ThinkerSubmodule(ARNodeSubmodule):
             seq_len = text_ids.shape[0]
             # A text row leaves its positions to the plan, which starts from the
             # counter a cache hit has already moved.
-            masks_for_talker = torch.stack([
-                torch.zeros(text_ids.shape, dtype=torch.bool, device=device), # multimodal
-                talker_text_mask(text_ids, self.config) # text inclusion
-            ])
+            tensor_inputs = {}
+            if _speaks(fwd_info):
+                tensor_inputs["masks_for_talker"] = torch.stack([
+                    torch.zeros(text_ids.shape, dtype=torch.bool, device=device), # multimodal
+                    talker_text_mask(text_ids, self.config) # text inclusion
+                ])
             return ARNodeInputs(
                 input_seq_len=seq_len,
                 input_embeds=embeds,
                 input_ids=text_ids,
-                tensor_inputs={
-                    "masks_for_talker": masks_for_talker
-                }
+                tensor_inputs=tensor_inputs,
             )
 
         # an audio or vision row's own positions start from the stream's counter
@@ -534,20 +539,19 @@ class ThinkerSubmodule(ARNodeSubmodule):
             rid=fwd_info.rid_handle, label="main"
         )
         if graph_walk == "prefill_audio":
-            return self._audio_inputs(inputs, start_pos, device)
+            return self._audio_inputs(inputs, start_pos, device, _speaks(fwd_info))
 
         if graph_walk == "prefill_vision":
             vision_embeds = inputs["vision_embeds"][0].to(device)
             vision_len = vision_embeds.shape[0]
 
-            mm_mask = torch.ones(vision_len + 2, dtype=torch.bool, device=device)
-            # fill_ on a view, as for audio: an index write would copy from the host
-            mm_mask[0].fill_(False)
-            mm_mask[-1].fill_(False)
-            masks_for_talker = torch.stack([
-                mm_mask,
-                ~mm_mask
-            ])
+            tensor_inputs = {}
+            if _speaks(fwd_info):
+                mm_mask = torch.ones(vision_len + 2, dtype=torch.bool, device=device)
+                # fill_ on a view, as for audio: an index write would copy from the host
+                mm_mask[0].fill_(False)
+                mm_mask[-1].fill_(False)
+                tensor_inputs["masks_for_talker"] = torch.stack([mm_mask, ~mm_mask])
 
             wrapped_embeds = self._wrap_vision_input(vision_embeds)
             total_len = vision_len + 2
@@ -600,17 +604,20 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 input_embeds=wrapped_embeds,
                 custom_pos_ids=pos_ids,
                 tensor_inputs={
-                    "masks_for_talker": masks_for_talker,
+                    **tensor_inputs,
                     "mrope_pos_advance": mrope_pos_advance,
                     "deepstack": deepstack,
                 }
             )
 
-    def _audio_inputs(self, inputs: NameToTensorList, start_pos: int, device: torch.device) -> ARNodeInputs:
+    def _audio_inputs(
+        self, inputs: NameToTensorList, start_pos: int, device: torch.device, speaks: bool,
+    ) -> ARNodeInputs:
         """A clip between its sentinels, after the prompt's leading span when
         that runs here and before the text that follows the clip. Text rows
         take text positions, the same in all three components, as a text
-        walk would place them; the clip's are linear too."""
+        walk would place them; the clip's are linear too. The Talker's masks
+        only for a request that ``speaks``."""
         audio_embeds = inputs["audio_embeds"][0].to(device)  # (audio_tokens, hidden)
         audio_len = audio_embeds.shape[0]
         embeds, masks, pos, ids = [], [], [], []
@@ -620,10 +627,11 @@ class ThinkerSubmodule(ARNodeSubmodule):
             nonlocal at
             n = text_ids.shape[0]
             embeds.append(self.model.model.embed_tokens(text_ids))
-            masks.append(torch.stack([
-                torch.zeros(text_ids.shape, dtype=torch.bool, device=device),
-                talker_text_mask(text_ids, self.config),
-            ]))
+            if speaks:
+                masks.append(torch.stack([
+                    torch.zeros(text_ids.shape, dtype=torch.bool, device=device),
+                    talker_text_mask(text_ids, self.config),
+                ]))
             pos.append(get_rope_index_text(n, at, device))
             ids.append(text_ids)
             at += n
@@ -631,12 +639,13 @@ class ThinkerSubmodule(ARNodeSubmodule):
         prefix = inputs.get("text_prefix")
         if prefix:
             text(prefix[0].to(device))
-        # The sentinels are set with fill_ on a view: a Python scalar written
-        # by index is copied from the host, which waits for the step in flight.
-        mm_mask = torch.ones(audio_len + 2, dtype=torch.bool, device=device)
-        mm_mask[0].fill_(False)
-        mm_mask[-1].fill_(False)
-        masks.append(torch.stack([mm_mask, ~mm_mask]))
+        if speaks:
+            # The sentinels are set with fill_ on a view: a Python scalar written
+            # by index is copied from the host, which waits for the step in flight.
+            mm_mask = torch.ones(audio_len + 2, dtype=torch.bool, device=device)
+            mm_mask[0].fill_(False)
+            mm_mask[-1].fill_(False)
+            masks.append(torch.stack([mm_mask, ~mm_mask]))
         embeds.append(self._wrap_audio_input(audio_embeds))
         pos.append(get_rope_index_audio(audio_len + 2, at, device, self.config.thinker.position_id_per_seconds))
         # the prompt's ids for the clip, as HF's input_ids hold them, so the
@@ -655,7 +664,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             input_embeds=embeds,
             input_ids=torch.cat(ids) if len(ids) > 1 else ids[0],
             custom_pos_ids=torch.cat(pos, dim=1) if len(pos) > 1 else pos[0],
-            tensor_inputs={"masks_for_talker": torch.cat(masks, dim=1) if len(masks) > 1 else masks[0]},
+            tensor_inputs={"masks_for_talker": torch.cat(masks, dim=1)} if masks else {},
         )
 
     MAX_BATCH_TOKENS = 1024
@@ -674,7 +683,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
         if unknown:
             raise NotImplementedError(f"Thinker cannot cut tensor inputs {sorted(unknown)}")
         cut = super().split_inputs(graph_walk, fwd_info, replace(inputs, tensor_inputs={}), start, end)
-        cut.tensor_inputs = {"masks_for_talker": tensors["masks_for_talker"][:, start:end]}
+        cut.tensor_inputs = {}
+        if "masks_for_talker" in tensors:
+            cut.tensor_inputs["masks_for_talker"] = tensors["masks_for_talker"][:, start:end]
         if graph_walk == "prefill_vision":
             cut.tensor_inputs["deepstack"] = [layer[start:end] for layer in tensors["deepstack"]]
             cut.tensor_inputs["mrope_pos_advance"] = tensors["mrope_pos_advance"]
