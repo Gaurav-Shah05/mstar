@@ -481,8 +481,15 @@ class ThinkerSubmodule(ARNodeSubmodule):
             return InputSeqLenInfo(inputs["text_inputs"][0].shape[0])
         name = self._EMBED_INPUTS.get(graph_walk)
         if name is not None and name in inputs:
-            return InputSeqLenInfo(inputs[name][0].shape[0] + 2)
+            return InputSeqLenInfo(inputs[name][0].shape[0] + 2 + self._suffix_len(graph_walk, inputs))
         return None
+
+    @staticmethod
+    def _suffix_len(graph_walk: str, inputs: NameToTensorList) -> int:
+        """Tokens of the text span an audio walk prefills after its clip."""
+        if graph_walk != "prefill_audio" or not inputs.get("text_inputs"):
+            return 0
+        return inputs["text_inputs"][0].shape[0]
 
     def prepare_inputs(
         self,
@@ -544,19 +551,30 @@ class ThinkerSubmodule(ARNodeSubmodule):
             end_pos_ids = get_rope_index_text(
                 1, start_pos + 1 + audio_len, device
             )
-            pos_ids = torch.cat(
-                [start_pos_ids, audio_pos_ids, end_pos_ids], dim=1
-            )
             mm_mask = torch.ones(audio_len + 2, dtype=torch.bool, device=device)
             mm_mask[0] = False
             mm_mask[-1] = False
+            masks = torch.stack([mm_mask, ~mm_mask])
+            embeds = self._wrap_audio_input(audio_embeds)
+            pos_parts = [start_pos_ids, audio_pos_ids, end_pos_ids]
+            tensor_inputs = {}
+            suffix = inputs.get("text_inputs")
+            if suffix:
+                # the text span after the clip, positioned as a text walk would
+                # place it: on from the end sentinel, all three components alike
+                text_ids = suffix[0].to(device)
+                pos_parts.append(get_rope_index_text(text_ids.shape[0], start_pos + audio_len + 2, device))
+                embeds = torch.cat([embeds, self.model.model.embed_tokens(text_ids)])
+                masks = torch.cat([masks, torch.stack([
+                    torch.zeros(text_ids.shape, dtype=torch.bool, device=device),
+                    talker_text_mask(text_ids, self.config),
+                ])], dim=1)
+                tensor_inputs["suffix_ids"] = text_ids
             return ARNodeInputs(
-                input_seq_len=audio_len + 2,
-                input_embeds=self._wrap_audio_input(audio_embeds),
-                custom_pos_ids=pos_ids,
-                tensor_inputs={
-                    "masks_for_talker": torch.stack([mm_mask, ~mm_mask])
-                }
+                input_seq_len=embeds.shape[0],
+                input_embeds=embeds,
+                custom_pos_ids=torch.cat(pos_parts, dim=1),
+                tensor_inputs={"masks_for_talker": masks, **tensor_inputs},
             )
 
         if graph_walk == "prefill_vision":
@@ -641,7 +659,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
     ) -> ARNodeInputs:
         tensors = inputs.tensor_inputs
         # a key not cut here would be dropped from the chunk
-        unknown = tensors.keys() - {"masks_for_talker", "deepstack", "mrope_pos_advance"}
+        unknown = tensors.keys() - {"masks_for_talker", "deepstack", "mrope_pos_advance", "suffix_ids"}
         if unknown:
             raise NotImplementedError(f"Thinker cannot cut tensor inputs {sorted(unknown)}")
         cut = super().split_inputs(graph_walk, fwd_info, replace(inputs, tensor_inputs={}), start, end)
@@ -651,6 +669,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
             cut.tensor_inputs["mrope_pos_advance"] = tensors["mrope_pos_advance"]
         elif graph_walk == "prefill_audio":
             cut.tensor_inputs["mrope_pos_advance"] = inputs.input_seq_len
+            # the trailing text's ids are tracked once, by the chunk that ends the walk
+            if "suffix_ids" in tensors and end == inputs.input_seq_len:
+                cut.tensor_inputs["suffix_ids"] = tensors["suffix_ids"]
         return cut
 
     def declare_step(
@@ -674,9 +695,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 )
             )
         prefill_tokens = {
-            rid: inp.input_ids
+            rid: inp.input_ids if walk == "prefill_text" else inp.tensor_inputs["suffix_ids"]
             for rid, inp, walk in zip(request_ids, inputs, row_walks, strict=True)
-            if walk == "prefill_text"
+            if walk == "prefill_text" or "suffix_ids" in inp.tensor_inputs
         }
 
         pos_advance = None

@@ -608,12 +608,38 @@ def test_qwen_schedule_walks_the_plan():
     schedule = Qwen3OmniModel._build_thinker_prefill_schedule(model, mods, signals)
     assert [walk for walk, _ in schedule] == [
         "prefill_text", "prefill_vision", "prefill_text", "prefill_vision",
-        "prefill_text", "prefill_audio", "prefill_text",
+        "prefill_text", "prefill_audio",
     ]
+    # The audio walk prefills the text span after the clip.
+    assert schedule[-1][1]["text_inputs"] == "t3"
     # Each vision walk carries its own image, in order.
     vision = [entry for walk, entry in schedule if walk == "prefill_vision"]
     assert [e["pixel_values"] for e in vision] == ["px0", "px1"]
     assert [e["image_grid_thw"] for e in vision] == ["g0", "g1"]
+
+
+def test_qwen_a_clip_before_another_sends_its_walk_an_empty_text_edge():
+    """Two clips in a row: the first walk has no text span, and its Thinker,
+    which takes one, gets an empty edge rather than waiting for one."""
+    from mstar.conductor.request_info import CurrentForwardConductorMetadata
+    from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
+
+    model = Qwen3OmniModel.__new__(Qwen3OmniModel)
+    signals = {"text_inputs": ["t0", "t1"], "audio_features": ["af0", "af1"]}
+    schedule = Qwen3OmniModel._build_thinker_prefill_schedule(model, ["text", "audio", "audio", "text"], signals)
+    assert [walk for walk, _ in schedule] == ["prefill_text", "prefill_audio", "prefill_audio"]
+    assert "text_inputs" not in schedule[1][1] and schedule[2][1]["text_inputs"] == "t1"
+
+    def edges(step):
+        meta = CurrentForwardConductorMetadata(
+            input_modalities=[], output_modalities=["text"], graph_walk=schedule[step][0], is_prefill=True,
+            kwargs={"prefill_schedule": schedule, "prefill_step": step},
+        )
+        sent = Qwen3OmniModel._get_thinker_prefill_inputs(model, meta, {})
+        return {(e.next_node, e.name): e.tensor_info for e in sent}
+
+    assert edges(1) == {("audio_encoder", "audio_features"): ["af0"], ("Thinker", "text_inputs"): []}
+    assert edges(2) == {("audio_encoder", "audio_features"): ["af1"], ("Thinker", "text_inputs"): ["t1"]}
 
 
 def test_qwen_placeholder_ids_come_from_the_tokenizer():

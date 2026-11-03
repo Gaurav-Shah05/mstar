@@ -167,6 +167,11 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
     return str(Path(local_dir))
 
 
+def follows_audio(plan: list[PromptPart], i: int) -> bool:
+    """Whether text step ``i`` of a prefill plan runs in the audio walk before it."""
+    return i > 0 and plan[i].modality == TEXT and plan[i - 1].modality == "audio"
+
+
 class ImageSpan(NamedTuple):
     length: int
     advance: int
@@ -476,7 +481,8 @@ class Qwen3OmniModel(Model):
             ),
             GraphNode(
                 name="Thinker",
-                input_names=["audio_embeds"],
+                # the clip, then the text span that follows it in the prompt
+                input_names=["audio_embeds", "text_inputs"],
                 outputs=[
                     GraphEdge(
                         next_node=EMIT_TO_CLIENT,
@@ -860,6 +866,10 @@ class Qwen3OmniModel(Model):
         Each entry is ``(walk_name, {input_name: tensor_info})``, carrying every
         tensor that step's first node needs — for the modality walks, the
         auxiliary tensors alongside the primary feature tensor.
+
+        An audio clip's walk also prefills the text span after it (the
+        template always closes the turn with one), so each clip costs one walk
+        rather than two; ``_kv_layout`` lays the two out as one span.
         """
         texts = input_signals.get("text_inputs", [])
         schedule: list[tuple[str, dict[str, TensorPointerInfo]]] = []
@@ -867,10 +877,14 @@ class Qwen3OmniModel(Model):
         # ``check_plan`` already failed a mismatch at intake, where a 400 can
         # still be returned; skipping here keeps one that slipped through from
         # raising inside the conductor instead.
-        for step in prefill_plan(parts_from_modalities(input_modalities)):
+        plan = prefill_plan(parts_from_modalities(input_modalities))
+        for i, step in enumerate(plan):
             if step.modality == TEXT:
                 if step.index < len(texts):
-                    schedule.append(("prefill_text", {"text_inputs": texts[step.index]}))
+                    if follows_audio(plan, i) and schedule and schedule[-1][0] == "prefill_audio":
+                        schedule[-1][1]["text_inputs"] = texts[step.index]
+                    else:
+                        schedule.append(("prefill_text", {"text_inputs": texts[step.index]}))
                 continue
             walk, signal_names = self._MM_WALKS[step.modality]
             entry = {
@@ -913,9 +927,14 @@ class Qwen3OmniModel(Model):
         for input_name, tensor_info in tensor_dict.items():
             if input_name == "video_second_per_grid":
                 continue # goes directly to Thinker
-            edge = GraphEdge(next_node=target_node, name=input_name)
+            # an audio walk's trailing text span goes straight to the Thinker
+            node = "Thinker" if input_name == "text_inputs" else target_node
+            edge = GraphEdge(next_node=node, name=input_name)
             edge.tensor_info = [tensor_info]
             edges.append(edge)
+        if walk_name == "prefill_audio" and "text_inputs" not in tensor_dict:
+            # a clip right before another has no text span; the edge is empty
+            edges.append(GraphEdge(next_node="Thinker", name="text_inputs"))
 
         if walk_name == "prefill_vision":
             for key in ["image_grid_thw", "video_second_per_grid"]:
@@ -1353,10 +1372,31 @@ class Qwen3OmniModel(Model):
 
         merge = self.config.vision.spatial_merge_size
         thinker, talker, position = [], [], 0
-        for step in plan:
+        # The data worker keys each ids span by the next text_inputs entry, and
+        # a merged span takes one without being an ids span: keys stop at the
+        # first ids span after it.
+        merged, keyed = False, None
+        for i, step in enumerate(plan):
+            if follows_audio(plan, i):
+                merged = True
+                # the audio walk before it writes this span too: its ids join
+                # that span's key, and its rows the Talker's
+                ids = tensors["text_inputs"][step.index]
+                audio = thinker.pop()
+                thinker.append(audio._replace(
+                    length=audio.length + len(ids), advance=audio.advance + len(ids),
+                    params=tuple(ids.tolist()),
+                ))
+                kept = int(talker_text_mask(ids, self.config).sum())
+                rows_span = talker.pop()
+                talker.append(rows_span._replace(length=rows_span.length + kept, advance=rows_span.advance + kept))
+                position += len(ids)
+                continue
             if step.modality == TEXT:
                 ids = tensors["text_inputs"][step.index]
                 span = Span("ids", "prefill_text", len(ids), len(ids), "text_inputs")
+                if merged and keyed is None:
+                    keyed = len(thinker)
                 kept = int(talker_text_mask(ids, self.config).sum())
             elif step.modality == "audio":
                 # the encoder's rows between two sentinels
@@ -1385,10 +1425,11 @@ class Qwen3OmniModel(Model):
             position += span.advance
         prefix = TalkerSubmodule.TALKER_LAST_PREFILL_TOKENS_PER_REQ
         # A prompt with a video keys only its leading text, since keying past it has never been run or tested.
-        video = any(step.modality == "video" for step in plan)
+        if any(step.modality == "video" for step in plan):
+            keyed = 1
         return {
             THINKER_KV: {"main": LabelLayout(
-                spans=tuple(thinker), growth=(("thinker_decode_loop", 1),), keyed_spans=1 if video else None,
+                spans=tuple(thinker), growth=(("thinker_decode_loop", 1),), keyed_spans=keyed,
             )},
             TALKER_KV: {"main": LabelLayout(
                 spans=(*talker, Span("rows", "talker_last_prefill", prefix, prefix, "thinker_states")),

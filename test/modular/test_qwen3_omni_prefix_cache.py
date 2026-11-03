@@ -234,15 +234,43 @@ def test_the_layout_lists_each_walk_the_schedule_runs_with_the_slots_it_writes(m
     layout = out.metadata["kv_layout"][THINKER_KV]["main"].spans
     signals = {name: [object()] * len(value) for name, value in out.new_input_tensors.items()}
 
-    walks = [walk for walk, _ in model._build_thinker_prefill_schedule(modalities, signals)]
+    schedule = model._build_thinker_prefill_schedule(modalities, signals)
     segments = iter(out.new_input_tensors["text_inputs"])
     media = iter(items)
-    expected = [
-        ("prefill_text", len(next(segments)), None) if walk == "prefill_text" else next(media) for walk in walks
-    ]
+    expected = []
+    for walk, entry in schedule:
+        if walk == "prefill_text":
+            expected.append(("prefill_text", len(next(segments)), None))
+            continue
+        walk, length, advance = next(media)
+        # an audio walk also writes the text span after its clip
+        extra = len(next(segments)) if "text_inputs" in entry else 0
+        expected.append((walk, length + extra, advance + extra))
     assert [(span.walk, span.length, None if span.kind == "ids" else span.advance) for span in layout] == expected, (
         "the layout disagrees with the walks the schedule runs, so the cache would drop it partway through"
     )
+
+
+def test_an_audio_walks_key_names_the_text_it_prefills(model):
+    """The clip's span also holds the text after it, so the trailing ids join
+    its key: the same clip before other text must not hit those pages."""
+    out = _prompt(model, ["audio", "text"], {"audio_inputs": [torch.zeros(16000)]})
+    layout = out.metadata["kv_layout"][THINKER_KV]["main"]
+    audio = layout.spans[1]
+    assert audio.kind == "digest" and audio.params == tuple(out.new_input_tensors["text_inputs"][1].tolist())
+    assert layout.keyed_count() == len(layout.spans)
+
+
+def test_keys_stop_at_the_first_ids_span_after_an_audio_walk(model):
+    """The data worker keys each ids span by the next text_inputs entry, and an
+    audio walk's span takes one of them without being an ids span."""
+    out = _prompt(
+        model, ["audio", "text", "image", "text"],
+        {"audio_inputs": [torch.zeros(16000)], "image_inputs": [torch.rand(3, 64, 96)]},
+    )
+    layout = out.metadata["kv_layout"][THINKER_KV]["main"]
+    assert [span.walk for span in layout.spans] == ["prefill_text", "prefill_audio", "prefill_vision", "prefill_text"]
+    assert layout.keyed_count() == 3
 
 
 def test_a_prompt_with_a_video_keys_only_its_leading_text(model):
