@@ -80,14 +80,20 @@ def mmmu_items(data: Path, n: int) -> list[tuple[str, bytes]]:
     return out
 
 
-def items(data: Path) -> list[dict]:
+VIDEO_PROMPTS = ("Describe what happens in this video.", "What changes between the start and the end of this video?")
+
+
+def items(data: Path, videos: list[str] = ()) -> list[dict]:
+    """The gate's 64 text and 16 image prompts, and two prompts per video in
+    ``videos``, which are scored as a subset of their own."""
     return (
         [{"kind": "text", "prompt": p} for p in sharegpt_prompts(data, 64)]
         + [{"kind": "image", "prompt": q, "image": base64.b64encode(img).decode()} for q, img in mmmu_items(data, 16)]
+        + [{"kind": "video", "prompt": q, "video": str(Path(v).resolve())} for v in videos for q in VIDEO_PROMPTS]
     )
 
 
-def generate(url: str, prompt: str, image: bytes | None, new_tokens: int) -> tuple[str, list[int]]:
+def generate(url: str, prompt: str, media: tuple[str, bytes] | None, new_tokens: int) -> tuple[str, list[int]]:
     """The reply's text and the sampled ids, a stop token included."""
     boundary = uuid.uuid4().hex
     parts: list[bytes] = []
@@ -98,11 +104,13 @@ def generate(url: str, prompt: str, image: bytes | None, new_tokens: int) -> tup
     field("text", prompt)
     field("output_modalities", "text")
     field("model_kwargs", json.dumps({"temperature": 0.0, "max_output_tokens": new_tokens, "return_token_ids": True}))
-    if image is not None:
-        field("input_modalities", "image,text")
+    if media is not None:
+        modality, payload = media
+        field("input_modalities", f"{modality},text")
+        name = "video.mp4" if modality == "video" else "image.png"
         parts.append(
-            f'--{boundary}\r\nContent-Disposition: form-data; name="files"; filename="image.png"\r\n'
-            "Content-Type: application/octet-stream\r\n\r\n".encode() + image + b"\r\n"
+            f'--{boundary}\r\nContent-Disposition: form-data; name="files"; filename="{name}"\r\n'
+            "Content-Type: application/octet-stream\r\n\r\n".encode() + payload + b"\r\n"
         )
     parts.append(f"--{boundary}--\r\n".encode())
     request = urllib.request.Request(
@@ -123,10 +131,14 @@ def generate(url: str, prompt: str, image: bytes | None, new_tokens: int) -> tup
 
 
 def record(args) -> int:
-    run = items(Path(args.data))
+    run = items(Path(args.data), args.videos)
     for item in run:
-        image = base64.b64decode(item["image"]) if item["kind"] == "image" else None
-        item["served"], item["served_ids"] = generate(args.url, item["prompt"], image, args.new_tokens)
+        media = None
+        if item["kind"] == "image":
+            media = ("image", base64.b64decode(item["image"]))
+        elif item["kind"] == "video":
+            media = ("video", Path(item["video"]).read_bytes())
+        item["served"], item["served_ids"] = generate(args.url, item["prompt"], media, args.new_tokens)
         if not item["served_ids"]:
             raise RuntimeError("the server sent no token ids; it must honour return_token_ids")
     Path(args.out).write_text(json.dumps({"new_tokens": args.new_tokens, "items": run}))
@@ -148,15 +160,18 @@ def score(args) -> int:
 
     def inputs(item):
         content = [{"type": "text", "text": item["prompt"]}]
-        images = None
+        media = {}
         if item["kind"] == "image":
             content.insert(0, {"type": "image"})
             # as opened: the processor composites transparency on white, as the server does
-            images = [Image.open(io.BytesIO(base64.b64decode(item["image"])))]
+            media["images"] = [Image.open(io.BytesIO(base64.b64decode(item["image"])))]
+        elif item["kind"] == "video":
+            content.insert(0, {"type": "video"})
+            media["videos"] = [item["video"]]
         text = processor.apply_chat_template(
             [{"role": "user", "content": content}], tokenize=False, add_generation_prompt=True,
         )
-        return processor(text=[text], images=images, return_tensors="pt").to("cuda")
+        return processor(text=[text], **media, return_tensors="pt").to("cuda")
 
     def agreement(batch, reply: torch.Tensor) -> tuple[int, int]:
         """Positions of ``reply`` whose token is the sdpa forward's argmax."""
@@ -184,8 +199,9 @@ def score(args) -> int:
         eager = out[0, batch["input_ids"].shape[1]:]
         for name, reply in (("served", served), ("hf eager", eager)):
             hit, n = agreement(batch, reply)
-            totals[name][0] += hit
-            totals[name][1] += n
+            if item["kind"] != "video":  # the gate is the text and image prompts
+                totals[name][0] += hit
+                totals[name][1] += n
             kind = per_kind.setdefault((name, item["kind"]), [0, 0])
             kind[0] += hit
             kind[1] += n
@@ -195,7 +211,11 @@ def score(args) -> int:
         print(f"{name:9s} {kind:5s} {hit}/{n} = {hit / n:.4f}")
     rate = {name: hit / n for name, (hit, n) in totals.items()}
     for name, (hit, n) in totals.items():
-        print(f"{name:9s} all   {hit}/{n} = {rate[name]:.4f}")
+        print(f"{name:9s} gate  {hit}/{n} = {rate[name]:.4f}")
+    if ("served", "video") in per_kind:
+        (sv, sn), (ev, en) = per_kind[("served", "video")], per_kind[("hf eager", "video")]
+        verdict = "PASS" if sv / sn >= ev / en else "FAIL"
+        print(f"video subset: {verdict} (served {sv / sn:.4f} vs hf eager {ev / en:.4f})")
     Path(args.out).write_text(json.dumps(data))  # with each item's hits, for a closer look
     passed = rate["served"] >= rate["hf eager"]
     print("PASS" if passed else "FAIL", f"(served {rate['served']:.4f} vs hf eager {rate['hf eager']:.4f})")
@@ -210,6 +230,7 @@ def main() -> int:
     parser.add_argument("--out", required=True)
     parser.add_argument("--new-tokens", type=int, default=64)
     parser.add_argument("--data", default="data", help="holds sharegpt/ and mmmu/ (see SHAREGPT, MMMU)")
+    parser.add_argument("--videos", nargs="*", default=[], help="video files, scored as their own subset")
     args = parser.parse_args()
     return record(args) if args.phase == "record" else score(args)
 
