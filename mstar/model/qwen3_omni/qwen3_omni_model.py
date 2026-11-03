@@ -58,6 +58,7 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
+from mstar.engine.resources.spec import CombinedSplit
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import (
@@ -126,6 +127,11 @@ def apply_code2wav_serving_overrides(code2wav, model_kwargs: dict) -> None:
             value = model_kwargs.pop(name)
             setattr(code2wav, name, tuple(value) if isinstance(value, list) else value)
     code2wav.check_streaming_knobs()
+
+
+_THINKER_MIXED_SPLIT = CombinedSplit(
+    THINKER_MIXED, prefill_walks=("prefill_text", "prefill_audio", "prefill_vision"),
+)
 
 
 def _thinker_to_talker_policy() -> FixedChunkPolicy:
@@ -289,7 +295,10 @@ class Qwen3OmniModel(Model):
                 resource_key=THINKER_ATTN,
                 nodes={"Thinker"},
                 config=AttentionConfig(
-                    kv_cache=THINKER_KV
+                    kv_cache=THINKER_KV,
+                    # a mixed step's decode rows take the decode kernel and only
+                    # its prompt rows the prefill one
+                    splits=(_THINKER_MIXED_SPLIT,),
                 ),
             ),
             AttentionSpec(
