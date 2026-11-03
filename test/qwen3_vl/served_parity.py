@@ -10,7 +10,7 @@ Two phases, so the server and the reference never share the GPU:
 ``record`` sends each prompt (64 ShareGPT first turns, 16 MMMU validation
 questions with their image) greedily for ``--new-tokens`` tokens and keeps the
 text. ``score`` rebuilds each prompt with transformers' processor, appends the
-served reply (retokenized: the API streams text), and runs transformers' sdpa
+served reply (its sampled ids, ``return_token_ids``), and runs transformers' sdpa
 forward over the whole sequence; a position agrees when its argmax is the next
 token. The bar is transformers' eager-attention greedy reply scored the same
 way: the served model must agree at least as often as transformers does with
@@ -87,9 +87,8 @@ def items(data: Path) -> list[dict]:
     )
 
 
-def generate(url: str, prompt: str, image: bytes | None, new_tokens: int) -> tuple[str, bool]:
-    """The reply's text, and whether its last character was cut by the token
-    cap (a cut reply cannot have ended on <|im_end|>)."""
+def generate(url: str, prompt: str, image: bytes | None, new_tokens: int) -> tuple[str, list[int]]:
+    """The reply's text and the sampled ids, a stop token included."""
     boundary = uuid.uuid4().hex
     parts: list[bytes] = []
 
@@ -98,7 +97,7 @@ def generate(url: str, prompt: str, image: bytes | None, new_tokens: int) -> tup
 
     field("text", prompt)
     field("output_modalities", "text")
-    field("model_kwargs", json.dumps({"temperature": 0.0, "max_output_tokens": new_tokens}))
+    field("model_kwargs", json.dumps({"temperature": 0.0, "max_output_tokens": new_tokens, "return_token_ids": True}))
     if image is not None:
         field("input_modalities", "image,text")
         parts.append(
@@ -110,23 +109,26 @@ def generate(url: str, prompt: str, image: bytes | None, new_tokens: int) -> tup
         f"{url}/generate", data=b"".join(parts),
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
     )
-    text = b""
+    text, ids = b"", []
     for line in urllib.request.urlopen(request, timeout=600):
         line = line.strip()
         if not line:
             continue
         msg = json.loads(line)
-        if msg.get("data") and msg.get("modality") == "text":
-            text += base64.b64decode(msg["data"])
-    decoded = text.decode(errors="ignore")
-    return decoded, len(decoded.encode()) != len(text)
+        if msg.get("modality") != "text":
+            continue
+        text += base64.b64decode(msg.get("data") or "")
+        ids += (msg.get("metadata") or {}).get("token_ids", [])
+    return text.decode(errors="replace"), ids
 
 
 def record(args) -> int:
     run = items(Path(args.data))
     for item in run:
         image = base64.b64decode(item["image"]) if item["kind"] == "image" else None
-        item["served"], item["cut"] = generate(args.url, item["prompt"], image, args.new_tokens)
+        item["served"], item["served_ids"] = generate(args.url, item["prompt"], image, args.new_tokens)
+        if not item["served_ids"]:
+            raise RuntimeError("the server sent no token ids; it must honour return_token_ids")
     Path(args.out).write_text(json.dumps({"new_tokens": args.new_tokens, "items": run}))
     print(f"recorded {len(run)} replies to {args.out}")
     return 0
@@ -140,8 +142,6 @@ def score(args) -> int:
     data = json.loads(Path(args.out).read_text())
     new_tokens = data["new_tokens"]
     processor = AutoProcessor.from_pretrained(args.repo)
-    tokenizer = processor.tokenizer
-    eos = tokenizer.convert_tokens_to_ids("<|im_end|>")
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         args.repo, dtype=torch.bfloat16, attn_implementation="sdpa",
     ).to("cuda").eval()
@@ -176,10 +176,7 @@ def score(args) -> int:
     per_kind = {}
     for item in data["items"]:
         batch = inputs(item)
-        served = tokenizer(item["served"], add_special_tokens=False, return_tensors="pt")["input_ids"][0].to("cuda")
-        if served.numel() < new_tokens and not item.get("cut"):
-            # stopped on <|im_end|>, which the stream does not carry
-            served = torch.cat([served, torch.tensor([eos], device="cuda")])
+        served = torch.tensor(item["served_ids"], device="cuda")
         model.set_attn_implementation("eager")
         with torch.no_grad():
             out = model.generate(**batch, max_new_tokens=new_tokens, do_sample=False)
@@ -192,12 +189,14 @@ def score(args) -> int:
             kind = per_kind.setdefault((name, item["kind"]), [0, 0])
             kind[0] += hit
             kind[1] += n
+            item[f"{name} hits"] = [hit, n]
 
     for (name, kind), (hit, n) in sorted(per_kind.items()):
         print(f"{name:9s} {kind:5s} {hit}/{n} = {hit / n:.4f}")
     rate = {name: hit / n for name, (hit, n) in totals.items()}
     for name, (hit, n) in totals.items():
         print(f"{name:9s} all   {hit}/{n} = {rate[name]:.4f}")
+    Path(args.out).write_text(json.dumps(data))  # with each item's hits, for a closer look
     passed = rate["served"] >= rate["hf eager"]
     print("PASS" if passed else "FAIL", f"(served {rate['served']:.4f} vs hf eager {rate['hf eager']:.4f})")
     return 0 if passed else 1
