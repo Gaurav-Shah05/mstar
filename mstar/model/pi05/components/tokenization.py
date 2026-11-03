@@ -1,26 +1,16 @@
-"""Tokenization wrapper for Pi0.5: PaliGemma tokenizer + state discretization."""
-
-import logging
+"""Tokenization wrapper for Pi0.5: the PaliGemma tokenizer."""
 
 import torch
 
 from mstar.model.pi05.config import Pi05Config
 
-logger = logging.getLogger(__name__)
-
-
-def normalize_prompt(prompt: str) -> str:
-    """Lowercase + strip whitespace, matching openpi's PaligemmaTokenizer."""
-    return prompt.strip().lower()
-
 
 class Pi05Tokenizer:
-    """Wrapper around the HF PaliGemma tokenizer that also tokenizes robot state.
+    """Wrapper around the HF PaliGemma tokenizer.
 
-    Robot state values are discretized into ``state_token_bins`` bins and mapped
-    to language token IDs starting at ``state_token_offset``. Pi0.5 reuses
-    bottom-of-vocab tokens for state bins so that PaliGemma's embedding table
-    can embed them directly.
+    The prompt is encoded as given, with a leading BOS and no other
+    normalization, as openpi's pi05 ``PaligemmaTokenizer.tokenize`` does; the
+    robot state is already part of it (see ``Pi05Model.process_prompt``).
     """
 
     def __init__(self, hf_tokenizer, config: Pi05Config):
@@ -28,8 +18,6 @@ class Pi05Tokenizer:
         self.config = config
 
     def encode_prompt(self, prompt: str) -> torch.Tensor:
-        text = normalize_prompt(prompt)
-        ids = self.hf_tokenizer(text, add_special_tokens=True).input_ids
+        ids = self.hf_tokenizer(prompt, add_special_tokens=True).input_ids
         ids = ids[: self.config.max_lang_tokens]
         return torch.tensor(ids, dtype=torch.long)
-

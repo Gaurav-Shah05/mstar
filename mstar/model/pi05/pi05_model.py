@@ -492,17 +492,14 @@ class Pi05Model(Model):
     ) -> NameToTensorList | ProcessPromptOutput:
         """Tokenize the Pi0.5 prompt + robot state into a single token stream.
 
-        Pi0.5's production preprocessor (lerobot's
-        ``Pi05PrepareStateTokenizerProcessorStep``) builds a prompt of the
-        form::
+        The prompt is built as openpi's pi05 ``PaligemmaTokenizer.tokenize``
+        builds it::
 
             "Task: <text>, State: <bin0> <bin1> ... <bin31>;\\nAction: "
 
-        where each ``<bin_i>`` is the integer index (0–255) obtained by
-        digitizing the normalized state into 256 bins. The PaliGemma
-        tokenizer then encodes the whole string. We mirror that exactly
-        here so the resulting ``text_inputs`` stream matches the production
-        format.
+        where each ``<bin_i>`` is the state's bin index from
+        :func:`discretize_state`, and the PaliGemma tokenizer encodes the
+        whole string with a leading BOS.
         """
         if self.tokenizer is None:
             # Tokenizer-less fallback for dummy mode (skip_weight_loading), used by structural unit tests.
