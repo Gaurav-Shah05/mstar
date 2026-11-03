@@ -122,6 +122,34 @@ def test_pi05_load_image_ships_uint8_with_unchanged_vit_input(tmp_path):
     torch.testing.assert_close(from_uint8, from_float, rtol=0, atol=1e-6)
 
 
+def test_pi05_vit_prepares_every_camera_in_order():
+    """Each camera is letterboxed on its own and all of them reach SigLIP."""
+    submodule = Pi05ViTEncoderSubmodule(torch.nn.Identity(), Pi05Config(vit_image_size=8, num_cameras=3))
+    cameras = [
+        torch.full((3, 8, 8), 0, dtype=torch.uint8),
+        torch.full((3, 4, 8), 255, dtype=torch.uint8),
+        torch.full((3, 8, 8), 51, dtype=torch.uint8),
+    ]
+    pixels = submodule.prepare_inputs("prefill", None, {"image_inputs": cameras}).tensor_inputs["pixel_values"]
+    assert pixels.shape == (3, 3, 8, 8)
+    for i, camera in enumerate(cameras):
+        torch.testing.assert_close(pixels[i], submodule._prepare_one(camera)[0], rtol=0, atol=0)
+
+
+def test_pi05_prefix_scales_text_by_sqrt_hidden_and_leaves_images():
+    """openpi's embed_prefix: SigLIP tokens unscaled, text embeddings times sqrt(hidden_size)."""
+    from mstar.model.pi05.submodules import Pi05LLMSubmodule
+
+    config = Pi05Config(hidden_size=16, vocab_size=10)
+    embed = torch.nn.Embedding(config.vocab_size, config.hidden_size)
+    llm = Pi05LLMSubmodule(embed, None, None, None, None, None, config)
+    img_emb = torch.randn(5, config.hidden_size)
+    ids = torch.tensor([1, 2, 3])
+    prefix = llm.prepare_inputs("prefill", None, {"img_emb": [img_emb], "text_inputs": [ids]}).input_embeds
+    torch.testing.assert_close(prefix[:5], img_emb, rtol=0, atol=0)
+    torch.testing.assert_close(prefix[5:], embed(ids) * config.hidden_size ** 0.5)
+
+
 # ----------------------------------------------------------------------
 # Graph structure
 # ----------------------------------------------------------------------
@@ -351,6 +379,22 @@ def test_pi05_refuses_to_start_without_a_tokenizer(monkeypatch):
         model._load_tokenizer()
 
 
+def _camera_tensors(model, n=None):
+    n = model.config.num_cameras if n is None else n
+    return {"image_inputs": [torch.zeros(3, 8, 8, dtype=torch.uint8) for _ in range(n)]}
+
+
+@pytest.mark.parametrize("n", [1, 2, 4])
+def test_pi05_process_prompt_refuses_other_camera_counts(n):
+    model = _make_model()
+    model.tokenizer = _StubTokenizer()
+    with pytest.raises(ValueError, match="exactly 3 camera images"):
+        model.process_prompt(
+            prompt="hi", input_modalities=["image", "text"], output_modalities=["action"],
+            tensors=_camera_tensors(model, n),
+        )
+
+
 def test_pi05_process_prompt_formats_state_into_text():
     """Pi05Model.process_prompt should produce the openpi-style template
     ``"Task: <text>, State: <bin0> <bin1> ... <bin31>;\\nAction: "`` and
@@ -367,6 +411,7 @@ def test_pi05_process_prompt_formats_state_into_text():
         input_modalities=["image", "text"],
         output_modalities=["action"],
         robot_state=state,
+        tensors=_camera_tensors(model),
     ).new_input_tensors
 
     # Result is a single text_inputs entry — no separate state_inputs.
@@ -388,8 +433,9 @@ def test_pi05_process_prompt_without_state_uses_plain_text():
     model.tokenizer = stub
     result = model.process_prompt(
         prompt="hello world",
-        input_modalities=["text"],
+        input_modalities=["image", "text"],
         output_modalities=["action"],
+        tensors=_camera_tensors(model),
     ).new_input_tensors
     assert "text_inputs" in result
     assert stub.last_prompt == "hello world"
