@@ -881,7 +881,8 @@ class Qwen3OmniModel(Model):
         for i, step in enumerate(plan):
             if step.modality == TEXT:
                 if step.index < len(texts):
-                    if follows_audio(plan, i) and schedule and schedule[-1][0] == "prefill_audio":
+                    if (follows_audio(plan, i) and schedule and schedule[-1][0] == "prefill_audio"
+                            and "text_inputs" not in schedule[-1][1]):
                         schedule[-1][1]["text_inputs"] = texts[step.index]
                     else:
                         schedule.append(("prefill_text", {"text_inputs": texts[step.index]}))
@@ -980,7 +981,8 @@ class Qwen3OmniModel(Model):
     ) -> ForwardPassArgs:
         """Thinker partition state machine.
 
-        1. Build prefill schedule: [prefill_text] + [modality walks] + [prefill_text]
+        1. Build prefill schedule: text and attachment walks in prompt order
+           (an audio walk also takes the text span after its clip)
         2. Pop walks from schedule until done
         3. Transition to thinker_decode
         4. Each decode step: check new_token for EOS (im_end_token_id)

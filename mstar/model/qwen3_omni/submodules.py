@@ -374,7 +374,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
     Dispatches on graph_walk:
       - prefill_text:   embed text tokens, compute 3D MRoPE, fill KV cache
-      - prefill_audio:  splice audio embeddings, extend KV cache
+      - prefill_audio:  splice audio embeddings and the text span after the
+                        clip, extend KV cache
       - prefill_vision: splice vision embeddings, extend KV cache
       - thinker_decode: embed previous token, single-step decode
 
@@ -557,7 +558,11 @@ class ThinkerSubmodule(ARNodeSubmodule):
             masks = torch.stack([mm_mask, ~mm_mask])
             embeds = self._wrap_audio_input(audio_embeds)
             pos_parts = [start_pos_ids, audio_pos_ids, end_pos_ids]
-            tensor_inputs = {}
+            # the prompt's ids for the clip, as HF's input_ids hold them, so the
+            # sampler tracks this walk's tokens however it is cut or cached
+            ids = torch.full((audio_len + 2,), self.config.thinker.audio_token_id, dtype=torch.long, device=device)
+            ids[0] = self.config.thinker.audio_start_token_id
+            ids[-1] = self.config.thinker.audio_end_token_id
             suffix = inputs.get("text_inputs")
             if suffix:
                 # the text span after the clip, positioned as a text walk would
@@ -569,12 +574,13 @@ class ThinkerSubmodule(ARNodeSubmodule):
                     torch.zeros(text_ids.shape, dtype=torch.bool, device=device),
                     talker_text_mask(text_ids, self.config),
                 ])], dim=1)
-                tensor_inputs["suffix_ids"] = text_ids
+                ids = torch.cat([ids, text_ids])
             return ARNodeInputs(
                 input_seq_len=embeds.shape[0],
                 input_embeds=embeds,
+                input_ids=ids,
                 custom_pos_ids=torch.cat(pos_parts, dim=1),
-                tensor_inputs={"masks_for_talker": masks, **tensor_inputs},
+                tensor_inputs={"masks_for_talker": masks},
             )
 
         if graph_walk == "prefill_vision":
@@ -659,7 +665,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
     ) -> ARNodeInputs:
         tensors = inputs.tensor_inputs
         # a key not cut here would be dropped from the chunk
-        unknown = tensors.keys() - {"masks_for_talker", "deepstack", "mrope_pos_advance", "suffix_ids"}
+        unknown = tensors.keys() - {"masks_for_talker", "deepstack", "mrope_pos_advance"}
         if unknown:
             raise NotImplementedError(f"Thinker cannot cut tensor inputs {sorted(unknown)}")
         cut = super().split_inputs(graph_walk, fwd_info, replace(inputs, tensor_inputs={}), start, end)
@@ -669,9 +675,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
             cut.tensor_inputs["mrope_pos_advance"] = tensors["mrope_pos_advance"]
         elif graph_walk == "prefill_audio":
             cut.tensor_inputs["mrope_pos_advance"] = inputs.input_seq_len
-            # the trailing text's ids are tracked once, by the chunk that ends the walk
-            if "suffix_ids" in tensors and end == inputs.input_seq_len:
-                cut.tensor_inputs["suffix_ids"] = tensors["suffix_ids"]
         return cut
 
     def declare_step(
@@ -695,9 +698,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 )
             )
         prefill_tokens = {
-            rid: inp.input_ids if walk == "prefill_text" else inp.tensor_inputs["suffix_ids"]
+            rid: inp.input_ids
             for rid, inp, walk in zip(request_ids, inputs, row_walks, strict=True)
-            if walk == "prefill_text" or "suffix_ids" in inp.tensor_inputs
+            if walk in ("prefill_text", "prefill_audio")
         }
 
         pos_advance = None

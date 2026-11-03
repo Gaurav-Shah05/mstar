@@ -82,4 +82,8 @@ def test_an_audio_walk_with_its_text_matches_the_two_walks_it_replaces():
     masks = both.tensor_inputs["masks_for_talker"]
     assert torch.equal(masks[:, :n], alone.tensor_inputs["masks_for_talker"])
     assert not masks[0, n:].any() and torch.equal(masks[1, n:], talker_text_mask(text, config))
-    assert torch.equal(both.tensor_inputs["suffix_ids"], text)
+    # the prompt's ids, as HF's input_ids hold them: the clip's sentinels and pads, then the text
+    pads = [config.thinker.audio_token_id] * len(audio)
+    clip = [config.thinker.audio_start_token_id, *pads, config.thinker.audio_end_token_id]
+    assert alone.input_ids.tolist() == clip
+    assert both.input_ids.tolist() == clip + text.tolist()

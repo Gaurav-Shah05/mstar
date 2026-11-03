@@ -51,7 +51,8 @@ def thinker():
         im_start_token_id=1, im_end_token_id=8, system_token_id=2, assistant_token_id=3,
         thinker_hidden_size=HIDDEN,
         thinker=SimpleNamespace(
-            audio_start_token_id=4, audio_end_token_id=5, vision_start_token_id=6, vision_end_token_id=7,
+            audio_start_token_id=4, audio_end_token_id=5, audio_token_id=3,
+            vision_start_token_id=6, vision_end_token_id=7,
             position_id_per_seconds=25,
         ),
         vision=SimpleNamespace(spatial_merge_size=2, deepstack_visual_indexes=[1, 2]),
