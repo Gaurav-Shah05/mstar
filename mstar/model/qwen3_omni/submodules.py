@@ -552,17 +552,20 @@ class ThinkerSubmodule(ARNodeSubmodule):
             end_pos_ids = get_rope_index_text(
                 1, start_pos + 1 + audio_len, device
             )
+            # The sentinels are set with fill_ on a view: a Python scalar
+            # written by index is copied from the host, which waits for the
+            # step in flight.
             mm_mask = torch.ones(audio_len + 2, dtype=torch.bool, device=device)
-            mm_mask[0] = False
-            mm_mask[-1] = False
+            mm_mask[0].fill_(False)
+            mm_mask[-1].fill_(False)
             masks = torch.stack([mm_mask, ~mm_mask])
             embeds = self._wrap_audio_input(audio_embeds)
             pos_parts = [start_pos_ids, audio_pos_ids, end_pos_ids]
             # the prompt's ids for the clip, as HF's input_ids hold them, so the
             # sampler tracks this walk's tokens however it is cut or cached
             ids = torch.full((audio_len + 2,), self.config.thinker.audio_token_id, dtype=torch.long, device=device)
-            ids[0] = self.config.thinker.audio_start_token_id
-            ids[-1] = self.config.thinker.audio_end_token_id
+            ids[0].fill_(self.config.thinker.audio_start_token_id)
+            ids[-1].fill_(self.config.thinker.audio_end_token_id)
             suffix = inputs.get("text_inputs")
             if suffix:
                 # the text span after the clip, positioned as a text walk would
@@ -588,9 +591,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
             vision_len = vision_embeds.shape[0]
 
             mm_mask = torch.ones(vision_len + 2, dtype=torch.bool, device=device)
-            # scalar writes: a list index uploads from pageable memory, a host sync
-            mm_mask[0] = False
-            mm_mask[-1] = False
+            # fill_ on a view, as for audio: an index write would copy from the host
+            mm_mask[0].fill_(False)
+            mm_mask[-1].fill_(False)
             masks_for_talker = torch.stack([
                 mm_mask,
                 ~mm_mask
