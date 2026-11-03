@@ -36,7 +36,7 @@ from mstar.model.components.qwen_vision import (  # noqa: E402
 from mstar.model.qwen3_5.config import ATTN, GDN_STATE, KV_CACHE, LINEAR_ATTN, ROPE  # noqa: E402
 from mstar.model.qwen3_5.qwen3_5_model import STEP_GRIDS_KEY, TEXT_PART, VIDEO_PART  # noqa: E402
 from mstar.model.qwen3_5.weight_loader import load_qwen3_5_vision_weights  # noqa: E402
-from mstar.model.qwen3_vl.components.language_model import Qwen3VLTextModel  # noqa: E402
+from mstar.model.qwen3_vl.components.language_model import Qwen3VLForCausalLM, Qwen3VLTextModel  # noqa: E402
 from mstar.model.qwen3_vl.config import Qwen3VLConfig  # noqa: E402
 from mstar.model.qwen3_vl.qwen3_vl_model import Qwen3VLModel  # noqa: E402
 from mstar.model.qwen3_vl.submodules import DEEPSTACK, Qwen3VLLLMSubmodule  # noqa: E402
@@ -230,8 +230,10 @@ def test_deepstack_layers_add_after_their_layer(checkpoint):
 def test_text_model_keeps_inv_freq_fp32():
     config = Qwen3VLConfig(hidden_size=32, num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=1,
                            head_dim=16, intermediate_size=48, vocab_size=64, mrope_section=(2, 3, 3))
-    lm = Qwen3VLTextModel(config).to(torch.bfloat16)
-    assert lm._inv_freq.dtype == torch.float32
+    lm = Qwen3VLTextModel(config)
+    exact = lm.inv_freq.clone()
+    lm.to(torch.bfloat16)
+    assert lm.inv_freq.dtype == torch.float32 and torch.equal(lm.inv_freq, exact)
 
 
 def _run_tower(tower, pixels):
@@ -343,3 +345,84 @@ def test_resources_and_walks(checkpoint):
     encoder, llm = vision.sections
     assert {edge.name for edge in encoder.outputs} == {"vision_embeds", DEEPSTACK}
     assert DEEPSTACK in llm.input_names
+
+
+def test_vision_row_matches_transformers_layout(checkpoint):
+    """The prompt row the LLM node builds for prefill_vision (Qwen3.5's
+    `_vision_inputs` plus this model's deepstack rows): 3D positions equal to
+    transformers' `get_rope_index`, image embeddings and deepstack features at
+    the image tokens, and the position advance to the next text position."""
+    path, model = checkpoint
+    config, vision = Qwen3VLConfig.from_hf(path), QwenVisionConfig.from_hf(path)
+    lm = Qwen3VLForCausalLM(config).eval()
+    lm.model.load_checkpoint(path)
+    node = Qwen3VLLLMSubmodule(lm, config, vision)
+    node.node_resources = {ROPE: SimpleNamespace(position=lambda rid, label: 0)}
+
+    tokens = sum(t * (h // MERGE) * (w // MERGE) for t, h, w in GRID)
+    before, after = torch.tensor([5, 6, 7]), torch.tensor([8, 9])
+    torch.manual_seed(3)
+    merged = torch.randn(tokens, config.hidden_size)
+    features = [torch.randn(tokens, config.hidden_size) for _ in range(2)]
+    info = SimpleNamespace(
+        request_id="r", step_metadata={STEP_GRIDS_KEY: tuple(GRID), "prefill_order": (TEXT_PART, 1, TEXT_PART)},
+    )
+    with torch.no_grad():
+        row = node._vision_inputs(
+            info, {"text_inputs": [before, after], "vision_embeds": [merged], DEEPSTACK: features},
+        )
+
+    ids = torch.cat([before, torch.tensor([VISION_START, *[IMAGE] * tokens, VISION_END]), after])
+    image = ids == IMAGE
+    want, _ = model.model.get_rope_index(
+        ids[None], mm_token_type_ids=image.int()[None], image_grid_thw=torch.tensor(GRID),
+    )
+    assert torch.equal(row.custom_pos_ids.long(), want[:, 0])
+    assert row.tensor_inputs["mrope_advance"] == int(want.max()) + 1
+    with torch.no_grad():
+        torch.testing.assert_close(row.input_embeds[image], merged)
+        torch.testing.assert_close(row.input_embeds[~image], lm.model.embed(ids[~image]))
+    rows = row.tensor_inputs[DEEPSTACK]
+    for layer, feature in enumerate(features):
+        assert torch.equal(rows[image, layer], feature)
+    assert not rows[~image].any()
+
+
+def test_vision_node_splits_a_batch_by_request(checkpoint):
+    """Two requests through the vision node's eager forward together give each
+    one its own embeddings and deepstack features, as it gets alone."""
+    from mstar.model.qwen3_vl.submodules import Qwen3VLVisionEncoderSubmodule
+
+    path, _ = checkpoint
+    vision = QwenVisionConfig.from_hf(path)
+    tower = QwenVisionModel(vision).eval()
+    load_qwen3_5_vision_weights(tower, path)
+    patch = vision.in_channels * vision.temporal_patch_size * vision.patch_size ** 2
+    mean, std = torch.full((patch,), 120.0), torch.full((patch,), 60.0)
+    node = Qwen3VLVisionEncoderSubmodule(tower, vision, (mean, std))
+    grids = {"a": [(1, 4, 6)], "b": [(1, 2, 4), (1, 4, 4)]}
+    torch.manual_seed(4)
+    pixels = {rid: torch.randint(0, 256, (sum(t * h * w for t, h, w in g), patch), dtype=torch.uint8)
+              for rid, g in grids.items()}
+
+    def run(rids):
+        inputs = [
+            node.prepare_inputs("prefill_vision", SimpleNamespace(step_metadata={STEP_GRIDS_KEY: tuple(grids[r])}),
+                                {"pixel_values": [pixels[r]]})
+            for r in rids
+        ]
+        frames = [n for inp in inputs for n in inp.tensor_inputs["seq_lengths"]]
+        for block in tower.blocks:
+            block.attn.bind_resources({VISION_ATTN: FrameSDPA(frames)})
+        engine_inputs = SimpleNamespace(request_ids=list(rids), piecewise_leases={})
+        with torch.no_grad():
+            pre = node.preprocess("prefill_vision", engine_inputs, inputs)
+            return node.forward_batched("prefill_vision", engine_inputs, **pre)
+
+    together = run(["a", "b"])
+    for rid in grids:
+        alone = run([rid])[rid]
+        torch.testing.assert_close(together[rid]["vision_embeds"][0], alone["vision_embeds"][0], rtol=1e-5, atol=1e-5)
+        assert len(together[rid][DEEPSTACK]) == len(vision.deepstack_visual_indexes)
+        for mine, ref in zip(together[rid][DEEPSTACK], alone[DEEPSTACK], strict=True):
+            torch.testing.assert_close(mine, ref, rtol=1e-5, atol=1e-5)
