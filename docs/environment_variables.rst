@@ -509,6 +509,17 @@ Worker scheduling
        thread, which Whisper turbo's serve config sets: its 4-layer steps
        are too short to hide the planning in. Read by
        ``knobs.pre_plan_enabled``.
+   * - ``MSTAR_FULL_CPU_FREQUENCY``
+     - config's ``knobs: full_cpu_frequency``, else ``1``
+     - Every thread of the deployment asks the kernel for full CPU frequency
+       while runnable (``uclamp.min``; no spinning, idle threads stay asleep).
+       Under the ``schedutil`` governor a thread woken after about 10 ms asleep
+       runs up to 4x slower until the frequency ramps back up, and a step
+       hands off between many such threads: pi0.5 at c=1 on an H200 (Xeon 8568Y+)
+       spent 75 ms per action chunk without it and 41 ms with it; Qwen3-Omni's
+       text-to-speech throughput rose 31-60% at c=4-32. ``0`` for
+       a power-capped or shared host. A kernel that refuses the request logs a
+       warning. Read by ``knobs.full_cpu_frequency_enabled``.
    * - ``MSTAR_STEP_THREAD_CORE``
      - config's ``knobs: step_thread_core``, else ``off``
      - Pin each worker's main, GPU and plan threads to one core's two

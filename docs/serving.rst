@@ -388,7 +388,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,
        ``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
        ``kv_chain_lazy_steps``, ``kv_plan_cache``, ``kv_pinned_indptrs``,
-       ``gc_gen0_threshold``, ``pre_plan``, ``step_thread_core`` and
+       ``gc_gen0_threshold``, ``pre_plan``, ``step_thread_core``, ``full_cpu_frequency`` and
        ``compile_deterministic`` (``true``/``false`` or an integer; ``step_thread_core`` takes
        ``off``, the default, ``auto`` or a CPU number). ``compile_deterministic`` reaches
        Qwen3.5's text walks and no other model (see :doc:`models`). Each one's environment variable

@@ -21,6 +21,7 @@ KNOBS: dict[str, str] = {
     "pre_plan": "MSTAR_PRE_PLAN_SPEC",
     "step_thread_core": "MSTAR_STEP_THREAD_CORE",
     "compile_deterministic": "MSTAR_COMPILE_DETERMINISTIC",
+    "full_cpu_frequency": "MSTAR_FULL_CPU_FREQUENCY",
 }
 
 # this process's ``knobs:`` block, as strings in the env vars' format
@@ -188,6 +189,14 @@ def pre_plan_enabled() -> bool:
     4 layers), where the step is too short to hide the planning in and the
     extra thread is just GIL contention."""
     return _setting("pre_plan", "1") == "1"
+
+
+def full_cpu_frequency_enabled() -> bool:
+    """``full_cpu_frequency`` / ``MSTAR_FULL_CPU_FREQUENCY`` (default on):
+    every thread of the deployment asks for full CPU frequency while runnable
+    (``mstar.utils.cpus.run_at_full_frequency``). A power-capped or shared host
+    may turn it off."""
+    return _setting("full_cpu_frequency", "1") == "1"
 
 
 def step_thread_core() -> str | int:
