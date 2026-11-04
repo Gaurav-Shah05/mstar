@@ -58,7 +58,7 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
     # Engine imports live here so importing this module (registration
     # mapping, --help) never loads the model stacks.
     from mstar.api_server.auth import keep_api_key_from_children
-    from mstar.api_server.entrypoint import APIServer, _conductor_process_target, deployment_cpu_plan
+    from mstar.api_server.entrypoint import APIServer, _conductor_process_target, apply_cpu_settings
     from mstar.communication.communicator import CommProtocol
 
     # Dynamo's frontend serves HTTP here; this worker never checks a key, so
@@ -78,7 +78,7 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
 
     # before the workers exist: under ``auto`` this takes the GPUs' locks
     try:
-        cpus.install(deployment_cpu_plan(config))
+        apply_cpu_settings(config)
     except cpus.CpuPlanError as e:
         raise SystemExit(f"mstar: {e}") from None
     server = APIServer(
