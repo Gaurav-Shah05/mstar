@@ -2209,6 +2209,10 @@ V-JEPA2 declare it (``configs/vjepa2.yaml`` and ``configs/vjepa2_ac.yaml`` set 8
 sizes measured for their video decode). A model with client streams always prepares inline,
 since an append has to follow its request.
 
+A model that takes several images per request and whose ``load_image`` is mostly a decode can
+also set ``PREPROCESS_PARALLEL_IMAGES = True``, which decodes one request's images at once on a
+second pool, unless ``preprocess_workers`` is 1. Pi0.5 declares it for its camera frames.
+
 A pool that small is slow for a large copy, and a 121-frame 832x480 video is 145 MB. A
 video decoder should therefore emit its clip in the layout the encoder takes, transposed
 on the GPU inside its forward, so ``postprocess`` hands the tensor it reads straight to the

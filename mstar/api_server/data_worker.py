@@ -11,7 +11,7 @@ from collections import deque
 from collections.abc import Callable, Collection
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from functools import cached_property
+from functools import cached_property, partial
 from typing import NamedTuple
 
 import torch
@@ -47,7 +47,16 @@ from mstar.communication.tensors import (
 from mstar.engine.resources.kv.config import KVSpec, prefix_caches_by_rank
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
 from mstar.engine.resources.spec import apply_yaml_overrides
-from mstar.model.base import ClientChunk, Model, PrefixKeys, ProcessPromptOutput, Span, keyed_labels, names_checkpoint
+from mstar.model.base import (
+    ClientChunk,
+    Model,
+    PrefixKeys,
+    ProcessPromptOutput,
+    Span,
+    TensorAndMetadata,
+    keyed_labels,
+    names_checkpoint,
+)
 from mstar.model.media_limits import (
     RequestMediaBudget,
     charge_decoded_audio,
@@ -640,6 +649,7 @@ class PreprocessWorkerThread:
     # None (no model that declares it, one CPU's worth of workers, or a thread
     # built without __init__) prepares every request inline
     _prepare_pool: ThreadPool | None = None
+    _decode_pool: ThreadPool | None = None
     # Appends handled per pass before output delivery gets its turn again: one
     # for each of up to 32 live calls appending at once. An append costs a file
     # decode, far less than a request's preprocess, which is one per pass.
@@ -752,6 +762,9 @@ class PreprocessWorkerThread:
             self._prepare_pool = ThreadPool(
                 max_workers=self._prepare_workers, thread_name_prefix="mstar-prepare",
             )
+        decode_workers = self._num_decode_workers()
+        if decode_workers > 1:
+            self._decode_pool = ThreadPool(max_workers=decode_workers, thread_name_prefix="mstar-decode")
         # Requests on the prepare pool, oldest first. They reach the conductor
         # in this order, whichever finishes first.
         self._preparing: deque[PreparingInput] = deque()
@@ -768,6 +781,13 @@ class PreprocessWorkerThread:
         # each request runs on this process's intra-op pool, which the config
         # or the model may size above the plan's default
         return cpus.plan().prepare_workers(torch.get_num_threads())
+
+    def _num_decode_workers(self) -> int:
+        """One request's images decoded at once. A deployment preparing inline
+        (``preprocess_workers: 1``) gets no overlap from this pool either."""
+        if not getattr(self.model, "PREPROCESS_PARALLEL_IMAGES", False) or self._prepare_workers <= 1:
+            return 1
+        return cpus.plan().preprocess_threads
 
     def _cleanup_request_state(self, request_id: str, *, force: bool = False) -> None:
         """Release transport and postprocessing state owned by this thread.
@@ -818,17 +838,24 @@ class PreprocessWorkerThread:
             input_metadata[key] = []
             if modality not in ("image", "audio", "video"):
                 continue
-            load = getattr(self.model, f"load_{modality}")
-            for filepath in paths:
-                with budget.file():
-                    if modality == "audio":
-                        check_audio_duration(filepath)
-                    out = load(filepath, self.device)
-                    if modality == "audio":
-                        charge_decoded_audio(out.data, out.metadata["sample_rate"])
+            load_file = partial(self._load_file, budget, modality)
+            # A request's images decode at once where the model's loaders may
+            # overlap: decoders release the GIL, and at one request in flight
+            # a robot's cameras are most of the time spent here.
+            pool = self._decode_pool if modality == "image" and len(paths) > 1 else None
+            for out in (pool.map(load_file, paths) if pool is not None else map(load_file, paths)):
                 tensors[key].append(out.data)
                 input_metadata[key].append(out.metadata)
         return tensors, input_metadata
+
+    def _load_file(self, budget: RequestMediaBudget, modality: str, filepath: str) -> TensorAndMetadata:
+        with budget.file():
+            if modality == "audio":
+                check_audio_duration(filepath)
+            out = getattr(self.model, f"load_{modality}")(filepath, self.device)
+            if modality == "audio":
+                charge_decoded_audio(out.data, out.metadata["sample_rate"])
+        return out
 
     def _process_input(
         self, input: PreprocessInput, profile: DataWorkerProfile | None = None,
@@ -2092,3 +2119,5 @@ class PreprocessWorkerThread:
             self._encode_pool.shutdown(wait=False, cancel_futures=True)
         if self._prepare_pool is not None:
             self._prepare_pool.shutdown(wait=False, cancel_futures=True)
+        if self._decode_pool is not None:
+            self._decode_pool.shutdown(wait=False, cancel_futures=True)
