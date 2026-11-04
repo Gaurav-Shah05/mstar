@@ -335,13 +335,13 @@ def test_siblings_needs_two_cores_per_gpu(tmp_path):
     assert _plan("siblings", ["0000:73:00.0"], parse_cpu_list("32-35,160-163"), root).pinned == {33, 161, 34}
 
 
-def test_siblings_is_never_what_auto_or_always_take(tmp_path):
+def test_always_takes_separate_cores_and_auto_takes_siblings(tmp_path):
     root = _sysfs(tmp_path)
     mask = parse_cpu_list("32-39,160-167")
-    for setting in ("auto", "always"):
-        plan = _plan(setting, [POD[0]], mask, root, reachable=POD)
-        assert all(len(w.cpus) == cpus.STEP_CORES for w in plan.workers) and _one_cpu_a_core(plan)
-    assert _plan("siblings", [POD[0]], mask, root, reachable=POD).workers[0].cpus == {32, 160}
+    plan = _plan("always", [POD[0]], mask, root, reachable=POD)
+    assert all(len(w.cpus) == cpus.STEP_CORES for w in plan.workers) and _one_cpu_a_core(plan)
+    for setting in ("auto", "siblings"):
+        assert _plan(setting, [POD[0]], mask, root, reachable=POD).workers[0].cpus == {32, 160}
 
 
 # ── a container given a few of the host's GPUs ──────────────────────────────
@@ -497,26 +497,36 @@ def test_a_shipped_config_gets_a_sound_plan_on_each_host(path, tmp_path, setting
         assert plan.pinned <= mask and len(plan.pinned) < len(mask)
         if setting == "always":
             assert len({siblings(c) for c in plan.pinned}) == len(plan.pinned), "two pinned CPUs share a core"
-    # auto pins none of them
-    assert not _plan("auto", addresses, HOST, smt_root).pinned
+    # auto places as siblings on that host
+    assert _plan("auto", addresses, HOST, smt_root).workers == _plan("siblings", addresses, HOST, smt_root).workers
 
 
-# ── auto pins nothing, and says why ─────────────────────────────────────────
-
-DEEP_INTEL = "on an Intel host whose cores sleep deep, the step threads on 3 cores of their own measured no faster"
-
+# ── auto: siblings where cores sleep deep, else nothing and why ─────────────
 
 @pytest.mark.parametrize("states", [XEON, SIERRA, [("C1", 1, False), ("C6", 100, False)]])
-def test_auto_on_a_deep_idle_intel_host_says_what_was_measured_there(tmp_path, states):
+@pytest.mark.parametrize("vendor", [INTEL, AMD])
+def test_auto_on_a_deep_idle_host_takes_siblings(tmp_path, monkeypatch, states, vendor):
     mask = parse_cpu_list("32-47,160-175")
     root, idle = _sysfs(tmp_path), _idle(tmp_path, mask, states)
+    monkeypatch.setattr(cpus, "_CPUINFO", _cpuinfo(tmp_path, vendor))
     plan = _plan("auto", ["0000:62:00.0"], mask, root, idle=idle)
-    assert plan.pinned == frozenset() and plan.workers == () and plan.declined and plan.left == len(mask)
-    assert plan.why.startswith("not pinned: " + DEEP_INTEL)
-    assert "step_thread_core siblings" in plan.why and plan.why.endswith("(step_thread_core always pins anyway)")
-    # always and siblings pin that host
-    assert _plan("always", ["0000:62:00.0"], mask, root, idle=idle).pinned == {32, 33, 34, 47}
-    assert _plan("siblings", ["0000:62:00.0"], mask, root, idle=idle).pinned == {32, 160, 47}
+    assert plan.pinned == {32, 160, 47} and not plan.declined
+    assert plan == _plan("siblings", ["0000:62:00.0"], mask, root, idle=idle)
+
+
+@pytest.mark.parametrize("mask", ["32", "32-34"])
+def test_auto_under_a_mask_too_small_declines_without_a_warning(tmp_path, mask):
+    mask = parse_cpu_list(mask)
+    root, idle = _sysfs(tmp_path), _idle(tmp_path, mask, XEON)
+    plan = _plan("auto", ["0000:62:00.0"], mask, root, idle=idle)
+    assert plan.pinned == frozenset() and plan.declined
+
+
+def test_auto_declines_a_device_with_no_pci_address(tmp_path):
+    mask = parse_cpu_list("32-47,160-175")
+    root, idle = _sysfs(tmp_path), _idle(tmp_path, mask, XEON)
+    plan = _plan("auto", ["0000:62:00.0", None], mask, root, idle=idle)
+    assert plan.pinned == frozenset() and plan.declined and "PCI address" in plan.why
 
 
 @pytest.mark.parametrize(("states", "why"), [
@@ -544,8 +554,8 @@ def test_auto_only_reads_the_servers_cpus(tmp_path):
                                                 idle=idle).why
 
 
-@pytest.mark.parametrize(("states", "vendor"), [(VM, INTEL), (XEON, AMD), (XEON, INTEL)])
-def test_auto_never_asks_for_device_addresses(tmp_path, monkeypatch, states, vendor):
+@pytest.mark.parametrize(("states", "vendor"), [(VM, INTEL), (VM, AMD), (XEON, ARM)])
+def test_auto_that_declines_never_asks_for_device_addresses(tmp_path, monkeypatch, states, vendor):
     def boom(devices):
         raise AssertionError("auto asked torch about its devices")
     monkeypatch.setattr(cpus, "device_addresses", boom)
@@ -562,7 +572,7 @@ def test_one_cpu_with_a_deep_state_is_enough(tmp_path):
     mask = parse_cpu_list("32-47,160-175")
     root, idle = _sysfs(tmp_path), _idle(tmp_path, range(32, 47), VM)
     _idle(tmp_path, [47], XEON)
-    assert DEEP_INTEL in _plan("auto", ["0000:62:00.0"], mask, root, idle=idle).why
+    assert _plan("auto", ["0000:62:00.0"], mask, root, idle=idle).pinned
 
 
 def test_the_real_sysfs_reader_tolerates_a_host_without_cpuidle(tmp_path):
@@ -572,7 +582,7 @@ def test_the_real_sysfs_reader_tolerates_a_host_without_cpuidle(tmp_path):
     assert cpus.deepest_idle([0], root) is None
 
 
-@pytest.mark.parametrize(("text", "this"), [(AMD, "this host's is AuthenticAMD"),
+@pytest.mark.parametrize(("text", "this"), [("vendor_id\t: HygonGenuine\n", "this host's is HygonGenuine"),
                                             (ARM, "/proc/cpuinfo names no vendor here")])
 def test_auto_on_a_cpu_vendor_it_is_not_measured_on_says_so(tmp_path, monkeypatch, text, this):
     mask = parse_cpu_list("32-39,160-167")
@@ -581,10 +591,10 @@ def test_auto_on_a_cpu_vendor_it_is_not_measured_on_says_so(tmp_path, monkeypatc
     # deep idle states and room for every thread: the vendor is what the line names
     plan = _plan("auto", [POD[0]], mask, root, reachable=POD)
     assert plan.pinned == frozenset() and plan.workers == () and plan.declined
-    assert plan.why == (f"not pinned: auto is measured on Intel hosts only and {this} "
+    assert plan.why == (f"not pinned: auto is measured on GenuineIntel and AuthenticAMD hosts only and {this} "
                         "(step_thread_core always pins anyway)")
     assert plan.left == len(mask)
-    # always, siblings and a number place as they do on Intel
+    # always, siblings and a number place as they do on the vendors auto takes
     assert _plan("always", [POD[0]], mask, root, reachable=POD).pinned == {32, 33, 34, 39}
     assert _plan("siblings", [POD[0]], mask, root, reachable=POD).pinned == {32, 160, 39}
     assert _plan(33, [POD[0]], mask, root).workers[0].cpus == {33, 161}
@@ -605,7 +615,6 @@ def test_auto_under_an_idle_hold_says_so_first(tmp_path, monkeypatch):
 
 def test_the_api_server_and_its_workers_read_the_idle_hold(api_plan, monkeypatch, gpu_locks, caplog):
     monkeypatch.setenv("MSTAR_STEP_THREAD_CORE", "auto")
-    assert DEEP_INTEL in api_plan().why
     monkeypatch.setenv("MSTAR_IDLE_HOLD", "qos")
     plan = api_plan()
     assert plan.pinned == frozenset() and plan.declined and "idle_hold qos" in plan.why
@@ -761,8 +770,9 @@ def test_deployment_workers_skips_what_the_conductor_reports():
     ("qwen3tts_1p7b_split.yaml", [0, 1], ["cuda:0", "cuda:0"]),                  # a split config
     ("qwen3_5_27b_tp4.yaml", [0, 1, 2, 3], ["cuda:0", "cuda:1", "cuda:2", "cuda:3"]),  # TP
 ])
+@pytest.mark.parametrize("setting", ["always", "auto"])
 def test_the_api_server_and_the_conductors_workers_build_one_plan(
-    name, ranks, devices, tmp_path, monkeypatch, gpu_locks,
+    name, ranks, devices, setting, tmp_path, monkeypatch, gpu_locks,
 ):
     """From the shipped config: the real conductor's worker list and what it
     hands each worker, the real API server plan and the real worker plan. No
@@ -815,8 +825,9 @@ def test_the_api_server_and_the_conductors_workers_build_one_plan(
 
     monkeypatch.setattr(cpus, "device_addresses", lambda ds: [at[d] for d in ds])
     monkeypatch.setattr(cpus, "deployment_plan", placed)
+    monkeypatch.setattr(cpus, "_CPU_ROOT", _idle(tmp_path / "held", cpus.process_mask(), XEON))
     monkeypatch.setattr(entrypoint, "accelerator_type", lambda: "cuda")
-    monkeypatch.setenv("MSTAR_STEP_THREAD_CORE", "always")
+    monkeypatch.setenv("MSTAR_STEP_THREAD_CORE", setting)
     api = entrypoint.deployment_cpu_plan(config)
     assert len(api.workers) == len(ranks) and api.result is not None
     assert all(api.result not in step.cpus for step in api.workers)
@@ -960,6 +971,7 @@ def api_plan(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cpus, "device_addresses", lambda devices: [A] * len(devices))
     monkeypatch.setattr(cpus, "deployment_plan", placed)
+    monkeypatch.setattr(cpus, "_CPU_ROOT", _idle(root.parent / "deep", cpus.process_mask(), XEON))
     monkeypatch.setattr(entrypoint, "accelerator_type", lambda: "cuda")
     config = {"node_groups": [{"node_names": ["llm"], "ranks": [0]}]}
     # back to this after the test: the refusal below writes the knob's env var
@@ -991,6 +1003,15 @@ def test_the_first_server_pins_and_the_second_pins_nothing_with_a_warning(other_
     assert worker._step_cpus.cpus == {41, 42, 43}
 
 
+def test_auto_takes_the_lock_when_it_pins(other_server, api_plan):
+    other, claimed = other_server(A)
+    assert claimed == "None"
+    os.environ["MSTAR_STEP_THREAD_CORE"] = "auto"
+    assert api_plan().pinned == frozenset()
+    assert os.environ["MSTAR_STEP_THREAD_CORE"] == "off", "its workers read the knob"
+    other.communicate("")
+
+
 def test_always_takes_the_lock_too(other_server, api_plan):
     other, claimed = other_server(A)
     assert claimed == "None"
@@ -1019,9 +1040,8 @@ def test_a_host_without_deep_idle_says_so_in_one_line(monkeypatch, caplog, tmp_p
 
 
 def test_only_a_placed_plan_that_pins_takes_the_lock(api_plan, monkeypatch, gpu_locks):
-    for setting in ("off", "auto"):
-        monkeypatch.setenv("MSTAR_STEP_THREAD_CORE", setting)
-        assert api_plan().pinned == frozenset()
+    monkeypatch.setenv("MSTAR_STEP_THREAD_CORE", "off")
+    assert api_plan().pinned == frozenset()
     monkeypatch.setenv("MSTAR_STEP_THREAD_CORE", "36")
     assert api_plan().pinned
     monkeypatch.setenv("MSTAR_STEP_THREAD_CORE", "always")
