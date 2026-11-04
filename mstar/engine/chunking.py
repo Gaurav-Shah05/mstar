@@ -45,6 +45,13 @@ class ChunkRange(NamedTuple):
         return self.end >= self.total
 
 
+class BucketCut(NamedTuple):
+    """A walk's captured token counts, ascending, and the fewest padded tokens
+    that make a cut at one of them worth a step of its own."""
+    counts: tuple[int, ...]
+    min_saved: int
+
+
 class ChunkingManagement:
     def __init__(self, submodules: Mapping[str, "SubmoduleManagement"]):
         # the engine's own mapping, which it fills as it loads nodes
@@ -183,6 +190,9 @@ class ChunkingManagement:
                 } or None
             self._walk_caps[key] = caps
         return self._walk_caps[key]
+
+    def bucket_cut_min_saved(self, node_name: str, graph_walk: str) -> int | None:
+        return self.policy(node_name, graph_walk).bucket_cut_min_saved
 
     def chunkable(self, node_name: str, graph_walk: str) -> bool:
         """The submodule's say, unless the serving config turned the walk's

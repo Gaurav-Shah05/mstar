@@ -186,3 +186,37 @@ def test_only_qwen3_5_text_walks_read_the_switch():
         and any(isinstance(n, ast.Name) and n.id == "compile_deterministic" for n in ast.walk(fn))
     ]
     assert methods == ["LLMSubmodule.get_accelerator_graph_configs"]
+
+
+def _dense(**kwargs):
+    """The model's `__init__` up to its checkpoint files, so no download."""
+    from mstar.model.qwen3_5 import qwen3_5_model as m
+
+    class StopHereError(Exception):
+        pass
+
+    def stop(*_a, **_k):
+        raise StopHereError
+
+    original = m._resolve_model_metadata
+    m._resolve_model_metadata = stop
+    try:
+        model = m.Qwen3_5DenseModel.__new__(m.Qwen3_5DenseModel)
+        with pytest.raises(StopHereError):
+            model.__init__("unused", **kwargs)
+    finally:
+        m._resolve_model_metadata = original
+    return model
+
+
+def test_the_bucket_cut_is_off_unless_a_config_sets_it():
+    policies = {w: p for p in _dense().get_chunking_policies()["LLM"] for w in p.walks}
+    assert {p.bucket_cut_min_saved for p in policies.values()} == {None}
+    policies = {w: p for p in _dense(bucket_cut_min_saved=512).get_chunking_policies()["LLM"] for w in p.walks}
+    assert {w: p.bucket_cut_min_saved for w, p in policies.items()} == {"prefill_text": 512, "mixed": 512}
+
+
+@pytest.mark.parametrize("bad", [0, -1, True, 512.0, "512"])
+def test_a_bad_bucket_cut_is_refused(bad):
+    with pytest.raises(ValueError, match="bucket_cut_min_saved"):
+        _dense(bucket_cut_min_saved=bad).get_chunking_policies()

@@ -1305,10 +1305,12 @@ class MicroScheduler:
                     row_tokens.update(tokens)
                     chunkable |= chunks
         min_chunk = 1
+        chain_tokens = 0
         if max_tokens is not None and row_tokens:
             min_chunk = engine.min_chunk_tokens(max_tokens)
             seq_lens = pre_existing_seq_lens() if pre_existing_seq_lens is not None else ()
-            max_tokens -= _pre_existing_tokens(seq_lens, pre_existing_batch_size)
+            chain_tokens = _pre_existing_tokens(seq_lens, pre_existing_batch_size)
+            max_tokens -= chain_tokens
         budgeted = max_tokens is not None and bool(row_tokens)
         return self._build_and_schedule(BatchBuildRequest(
             node_name=node_walk[0], graph_walk=node_walk[1],
@@ -1319,6 +1321,8 @@ class MicroScheduler:
             chunkable=chunkable,
             min_chunk_tokens=min_chunk,
             start_order=started,
+            bucket_cut=engine.bucket_cut(*node_walk) if budgeted and chunkable else None,
+            chain_tokens=chain_tokens,
         ), starts, resumed)
 
     def _mid_prefill_rows(

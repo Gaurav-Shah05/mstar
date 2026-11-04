@@ -1420,6 +1420,14 @@ class AcceleratorGraphRunner:
                 best = key
         return best
 
+    def captured_token_counts(self, graph_walk: str) -> tuple[int, ...]:
+        """The input-token counts this walk's captures replay at, ascending."""
+        return tuple(sorted({
+            key.num_tokens // bucket.config.total_tokens_multiplier
+            for key, bucket in self._buckets.items()
+            if key.graph_walk == graph_walk and bucket.slots
+        }))
+
     def captures_walk(self, graph_walk: str) -> bool:
         """Whether any capture replays this walk."""
         return any(

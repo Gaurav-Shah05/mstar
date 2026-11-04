@@ -474,6 +474,18 @@ and 2176 for a mixed step, since the LLM's 2048-token step budget
 (``MAX_BATCH_TOKENS``) caps prefill and mixed steps and no bucket past 2176 is
 reached. Each bucket adds captures and startup time.
 
+``model_kwargs: bucket_cut_min_saved: N`` (off by default, 512 in
+``configs/qwen3_5_9b.yaml``) cuts a step just past a bucket back to it when
+that avoids at least ``N`` padded tokens, net of the bucket the rest pads to. A
+lone 1034-token prompt then replays 1024 and a small bucket instead of 2048.
+On 9B (H200, ``--rust-frontend``, three fresh servers an arm, random 1024/256)
+TTFT p50 goes from 73.7 to 62.6 ms at c=1 and 76.1 to 72.5 at c=4, and output
+tok/s rises 2.6% at c=16, where TTFT p50 goes from 163.8 to 167.4 ms; ShareGPT
+is flat. A prompt cut this way keeps its prefix-cache GDN snapshot at an earlier
+page boundary, so a resend re-runs more tokens the first time. It stays off on
+0.8B, where one pair measured 0.98x tok/s at c=32 and 0.97x at c=64 with TTFT
+p50 rising 24-32%, and a second step appears to cost more than the padding.
+
 A captured decode step builds its rotary tables inside the graph from the
 planned positions, rather than staging tables built eagerly before the replay
 (that build sat on the per-step critical path: +13% output tok/s at c=32 on

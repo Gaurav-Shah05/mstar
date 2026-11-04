@@ -23,7 +23,7 @@ from mstar.engine.accelerator_graph_runner import (
     fail_if_graphs_required,
     plan_captures,
 )
-from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS, ChunkingManagement, ChunkRange
+from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS, BucketCut, ChunkingManagement, ChunkRange
 from mstar.engine.fp32_precision import Fp32Precision, cudnn_benchmark, fp32_precision_scope, node_fp32_precision
 from mstar.engine.node_dtype import resolve_node_dtype
 from mstar.engine.resources import (
@@ -2732,6 +2732,19 @@ class Engine:
 
     def get_max_batch_tokens(self, node_name: str, graph_walk: str) -> int | None:
         return self._chunking.max_batch_tokens(node_name, graph_walk)
+
+    def bucket_cut(self, node_name: str, graph_walk: str) -> BucketCut | None:
+        """What the scheduler needs to cut a step at a capture bucket, or None
+        where the walk doesn't ask for it or replays no capture."""
+        key = (node_name, graph_walk)
+        cuts = self.__dict__.setdefault("_bucket_cuts", {})
+        if key not in cuts:
+            min_saved = self._chunking.bucket_cut_min_saved(node_name, graph_walk)
+            runner = self._submodules[node_name].accelerator_graph_runner if min_saved is not None else None
+            # asked only once a step is built, so after capture
+            counts = runner.captured_token_counts(graph_walk) if runner is not None else ()
+            cuts[key] = BucketCut(counts, min_saved) if counts else None
+        return cuts[key]
 
     def set_token_budgets(
         self, overrides: Mapping[str, Any], walks: set[str],

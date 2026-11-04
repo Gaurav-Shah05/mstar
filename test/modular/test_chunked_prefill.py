@@ -13,9 +13,9 @@ sys.path.insert(0, ".")
 
 import torch
 
-from mstar.engine.chunking import ChunkRange
+from mstar.engine.chunking import BucketCut, ChunkRange
 from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
-from mstar.worker.batch_builder import fill_token_budget, fill_token_budget_in_start_order
+from mstar.worker.batch_builder import cut_to_bucket, fill_token_budget, fill_token_budget_in_start_order
 
 # ── the token budget ────────────────────────────────────────────────────
 
@@ -785,3 +785,80 @@ def test_a_chunked_walk_that_reports_no_row_length_is_refused():
 
     with pytest.raises(ValueError, match="get_input_sequence_len"):
         _unchunkable_nodes({"LLM": _Unmeasured()}, _chunking_model(), _groups())
+
+
+class TestCutToBucket:
+    CUT = BucketCut((32, 64, 128, 256, 512, 1024, 2048, 2176), 512)
+
+    def test_a_lone_prompt_just_past_a_bucket_cuts_to_it(self):
+        take = {1: 1034}
+        cut_to_bucket(take, {1}, self.CUT)
+        assert take == {1: 1024}
+
+    def test_decode_rows_count_and_only_the_prompt_is_cut(self):
+        take = {1: 1034, 2: 1, 3: 1}
+        cut_to_bucket(take, {1}, self.CUT, chain_tokens=13)
+        assert take == {1: 1009, 2: 1, 3: 1}
+
+    def test_a_step_on_a_bucket_stays(self):
+        take = {1: 1024}
+        cut_to_bucket(take, {1}, self.CUT)
+        assert take == {1: 1024}
+
+    def test_a_small_saving_stays_whole(self):
+        # 300 pads to 512; 256 + 64 saves only 192
+        take = {1: 300}
+        cut_to_bucket(take, {1}, self.CUT)
+        assert take == {1: 300}
+
+    def test_a_rest_that_pads_as_far_stays_whole(self):
+        # 1900 pads to 2048; 1024 + 1024 saves nothing
+        take = {1: 1900}
+        cut_to_bucket(take, {1}, self.CUT)
+        assert take == {1: 1900}
+
+    def test_nothing_chunkable_stays(self):
+        take = {1: 1034}
+        cut_to_bucket(take, set(), self.CUT)
+        assert take == {1: 1034}
+
+    def test_a_step_past_the_top_bucket_stays(self):
+        take = {1: 4000}
+        cut_to_bucket(take, {1}, self.CUT)
+        assert take == {1: 4000}
+
+    def test_the_cut_row_keeps_the_floor(self):
+        take = {1: 1030, 2: 12}
+        cut_to_bucket(take, {2}, self.CUT, min_chunk=8)
+        assert take == {1: 1030, 2: 12}
+
+
+def test_captured_token_counts_read_the_walks_buckets():
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner, BucketKey
+
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    held = SimpleNamespace(slots=[0], config=SimpleNamespace(total_tokens_multiplier=2))
+    runner._buckets = {
+        BucketKey(graph_walk="a", cg_key_info=None, bs=1, num_tokens=128): held,
+        BucketKey(graph_walk="a", cg_key_info=None, bs=4, num_tokens=128): held,
+        BucketKey(graph_walk="a", cg_key_info=None, bs=1, num_tokens=64): held,
+        BucketKey(graph_walk="a", cg_key_info=None, bs=1, num_tokens=256): SimpleNamespace(
+            slots=[], config=held.config,
+        ),
+        BucketKey(graph_walk="b", cg_key_info=None, bs=1, num_tokens=512): held,
+    }
+    assert runner.captured_token_counts("a") == (32, 64)
+
+
+def test_the_engine_answers_a_bucket_cut_once_and_only_where_asked():
+    from mstar.engine.engine import Engine
+
+    calls = []
+    runner = SimpleNamespace(captured_token_counts=lambda walk: calls.append(walk) or (64, 128))
+    engine = Engine.__new__(Engine)
+    engine._submodules = {"n": SimpleNamespace(accelerator_graph_runner=runner)}
+    engine._chunking = SimpleNamespace(bucket_cut_min_saved=lambda node, walk: 512 if walk == "on" else None)
+    assert engine.bucket_cut("n", "on") == BucketCut((64, 128), 512)
+    assert engine.bucket_cut("n", "on") == BucketCut((64, 128), 512)
+    assert engine.bucket_cut("n", "off") is None
+    assert calls == ["on"]

@@ -6,6 +6,8 @@ max_seq_len: 32768
 # is reached.
 model_kwargs:
   prefill_token_buckets: [32, 64, 128, 256, 512, 1024, 2048, 2176]
+  # A step just past a bucket cuts at it when that avoids this much padding (docs/models.rst)
+  bucket_cut_min_saved: 512
 node_groups:
   # Text, images and video. Colocated: the
   # encoder runs once per request, then idles.

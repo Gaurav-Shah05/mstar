@@ -165,18 +165,22 @@ class Qwen3_5DenseModel(Model):
     # thread is steadier but slower (13 ms).
     PREPROCESS_TORCH_THREADS = 4
     INTERNAL_KWARGS = (IMAGE_GRIDS_KEY, VIDEO_GRIDS_KEY)
+    # see `ChunkingPolicy.bucket_cut_min_saved`; off unless a config sets it
+    bucket_cut_min_saved: int | None = None
 
     def __init__(
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
         prefill_token_buckets: list[int] | None = None,
+        bucket_cut_min_saved: int | None = None,
         **kwargs: Any,
     ):
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         # the captured text-prefill ladder (`LLMSubmodule.PREFILL_TOKEN_BUCKETS`)
         self.prefill_token_buckets = prefill_token_buckets
+        self.bucket_cut_min_saved = bucket_cut_min_saved
 
         self.local_dir = _resolve_model_metadata(model_path_hf, cache_dir)
         self.config = Qwen3_5Config.from_hf(self.local_dir)
@@ -314,10 +318,13 @@ class Qwen3_5DenseModel(Model):
         from mstar.model.qwen3_5.submodules import LLMSubmodule
 
         budget = LLMSubmodule.MAX_BATCH_TOKENS
+        saved = self.bucket_cut_min_saved
         return {"LLM": (
-            ChunkingPolicy(walks=("prefill_text",), chunkable=True, max_batch_tokens=budget),
+            ChunkingPolicy(
+                walks=("prefill_text",), chunkable=True, max_batch_tokens=budget, bucket_cut_min_saved=saved,
+            ),
             # carries the budget for the steps that mix a chunk with decode rows
-            ChunkingPolicy(walks=(LLM_MIXED,), max_batch_tokens=budget),
+            ChunkingPolicy(walks=(LLM_MIXED,), max_batch_tokens=budget, bucket_cut_min_saved=saved),
         )}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:

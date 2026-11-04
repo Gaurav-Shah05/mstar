@@ -9,12 +9,14 @@ queues (``build_batch``).
 """
 
 from abc import ABC, abstractmethod
+from bisect import bisect_left
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
+    from mstar.engine.chunking import BucketCut
     from mstar.worker.micro_scheduler import ScheduledBatch
 
 
@@ -101,6 +103,10 @@ class BatchBuildRequest:
     min_chunk_tokens: int = 1
     # Rows already mid-prefill -> when their first chunk was cut; lower is older.
     start_order: dict[int, int] = field(default_factory=dict)
+    # Cut a step just past a capture bucket back to it; None where the walk doesn't.
+    bucket_cut: "BucketCut | None" = None
+    # Tokens the step carries beside these rows: a speculation chain's.
+    chain_tokens: int = 0
 
 
 class BatchBuildResult(NamedTuple):
@@ -319,6 +325,8 @@ class FIFOBatchBuilder(BaseBatchBuilder):
                 scheduled, take, dropped, request.chunkable, request.walk_max_tokens,
                 self.share_token_budget, request.min_chunk_tokens, request.start_order,
             )
+        if request.bucket_cut is not None:
+            cut_to_bucket(take, request.chunkable, request.bucket_cut, request.min_chunk_tokens, request.chain_tokens)
         chunk_tokens = {
             rid: n for rid, n in take.items() if n < request.row_tokens.get(rid, n)
         }
@@ -473,6 +481,29 @@ def fill_token_budget(
             dropped.add(rid)
     _run_head(rids, tokens, chunkable, budget, min_chunk, take, dropped)
     return take, dropped
+
+
+def cut_to_bucket(
+    take: dict[int, int], chunkable: set[int], cut: "BucketCut", min_chunk: int = 1, chain_tokens: int = 0,
+) -> None:
+    """Cut one chunkable row of ``take`` so the step lands on the capture
+    bucket below it, when the padding that avoids, net of the bucket the rest
+    then pads to, is at least ``cut.min_saved`` tokens. The longest row gives
+    up the tokens: it is the one left with the most to run anyway, whichever
+    prompt started first, and it may be the row the budget already cut. The
+    counts are the walk's at any batch size, so a miss only costs padding."""
+    total = chain_tokens + sum(take.values())
+    above = bisect_left(cut.counts, total)
+    if above == 0 or above == len(cut.counts) or cut.counts[above] == total:
+        return
+    lower = cut.counts[above - 1]
+    excess = total - lower
+    rest = bisect_left(cut.counts, excess)
+    if cut.counts[above] - lower - cut.counts[rest] < cut.min_saved:
+        return
+    rows = [rid for rid in take if rid in chunkable and take[rid] - excess >= min_chunk]
+    if rows:
+        take[max(rows, key=take.__getitem__)] -= excess
 
 
 def _cap_walks(
