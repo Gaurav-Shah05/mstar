@@ -687,6 +687,16 @@ Qwen3-Omni notes
   add captures, graph memory and startup time.
   ``configs/qwen3omni_2gpu.yaml`` and ``configs/qwen3omni_2gpu_h100.yaml``
   keep the default ladder.
+- An audio prompt's Thinker prefill runs in the clip's own walk
+  (``prefill_audio``): the text after the clip, and the text before it when that
+  span is shorter than one Thinker KV page (128 tokens), ride in the same step
+  as the clip's encoder rows instead of in prefill steps of their own. A
+  leading span of a page or more still runs first as its own ``prefill_text``
+  step, so its pages stay reusable across prompts with other clips. The fold
+  is decided at the page size the model declares, because the API server does
+  not see the deployment's ``resources:``; a smaller ``thinker_kv``
+  ``page_size`` there logs a warning, since leading spans between the two
+  sizes then lose that reuse.
 - The MoE layers route through the fused softmax-top-k kernel
   (``TopKRouter(fused_softmax_topk=True)``), which gives equal probabilities to
   the lower expert id where ``torch.topk`` may pick another.
