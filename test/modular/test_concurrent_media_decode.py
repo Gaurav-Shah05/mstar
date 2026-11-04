@@ -7,7 +7,6 @@ import pytest
 import torch
 from PIL import Image
 
-from mstar.api_server import data_worker
 from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.model.base import TensorAndMetadata
 from mstar.model.media_limits import RequestMediaBudget, _charge_request, read_image
@@ -122,10 +121,9 @@ def test_request_under_the_pixel_cap_loads_on_the_pool(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize(
     ("declared", "prepare_workers", "decode_workers"),
-    [(True, 5, 4), (True, 1, 1), (False, 5, 1)],
+    [(True, 5, 5), (True, 1, 1), (False, 5, 1)],
 )
-def test_decode_pool_needs_the_declaration_and_a_prepare_pool(monkeypatch, declared, prepare_workers, decode_workers):
-    monkeypatch.setattr(data_worker.cpus, "plan", lambda: SimpleNamespace(preprocess_threads=4))
+def test_decode_pool_needs_the_declaration_and_a_prepare_pool(declared, prepare_workers, decode_workers):
     worker = object.__new__(PreprocessWorkerThread)
     worker.model = SimpleNamespace(PREPROCESS_PARALLEL_IMAGES=declared)
     worker._prepare_workers = prepare_workers
