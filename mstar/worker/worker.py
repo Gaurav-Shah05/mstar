@@ -106,7 +106,7 @@ from mstar.utils.profiler import (
     range_push,
     set_step_key,
 )
-from mstar.utils.threads import ThreadPool, pin_thread
+from mstar.utils.threads import ThreadPool, pin_thread, set_thread_util_min
 from mstar.worker.batch_builder import BatchBuilderType
 from mstar.worker.chunk_loops import ChunkLoops
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
@@ -2307,6 +2307,7 @@ class Worker:
     def _pin_step_thread(self) -> None:
         if self._step_cpus is not None:
             pin_thread(self._step_cpus.cpus, self._process_cpus)
+        set_thread_util_min(knobs.step_thread_util_min())
 
     @contextmanager
     def _span(self, name: str, cpu: str | None = None):

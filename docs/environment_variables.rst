@@ -559,6 +559,18 @@ Worker scheduling
        server log their CPUs and why. See :ref:`host-idle` for measurements.
        Read by ``knobs.step_thread_core``; no effect where
        ``os.sched_setaffinity`` is missing (macOS, Windows).
+   * - ``MSTAR_STEP_THREAD_UTIL_MIN``
+     - config's ``knobs: step_thread_util_min``, else ``0``
+     - The ``uclamp`` floor, 0 to 1024, that each worker's main, GPU and plan
+       threads and the API server's result threads ask the scheduler for; 0
+       leaves them alone. Under the ``schedutil`` governor a step's threads
+       sleep and wake many times a step, read as lightly loaded, and run far
+       below the CPU's top frequency (1.0-1.5 GHz under load on a Xeon 8460Y+
+       with a 3.7 GHz turbo). Measured at 1024, ``step_thread_core: siblings``,
+       ``--rust-frontend``, Qwen3.5-0.8B on H200: see :doc:`models`. Threads and
+       processes they start inherit the floor. No effect under another governor
+       or without ``CONFIG_UCLAMP_TASK``; a refused call logs a warning. Read by
+       ``knobs.step_thread_util_min``.
    * - ``MSTAR_STEP_CORE_SET``
      - set by the API server
      - Which of the mask's core sets the API server locked under

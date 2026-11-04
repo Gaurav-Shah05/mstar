@@ -423,6 +423,13 @@ installed. Resizing follows the installed transformers version:
 transformers 5.22 turns on the per-frame pixel cap of qwen-vl-utils by
 default, which lowers the token count of short clips. Notes:
 
+- ``configs/qwen3_5_0.8b.yaml`` sets ``knobs: step_thread_util_min: 1024``. On one
+  H200 (Xeon 8460Y+, ``schedutil``), with ``step_thread_core: siblings`` and
+  ``--rust-frontend``, three fresh servers per arm: Random 1024/256 at c=64 goes from
+  9627 to 11313 tok/s and TTFT p50 from 168 to 80 ms; c=32 7758 to 7997, c=16 5196 to
+  5880 (one 6890 round; the other two about 5375); ShareGPT at c=64 11360 to 11686. Under
+  the config's default ``step_thread_core: auto``, which pins nothing here, it is
+  unmeasured, as is any other governor.
 - The vision encoder attends within each image and each video frame group
   separately, and its captured CUDA graphs hold up to 16384 patches and 64 such
   segments per prompt. A prompt over either limit runs the encoder without the

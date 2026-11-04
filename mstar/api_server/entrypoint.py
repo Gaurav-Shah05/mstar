@@ -76,7 +76,7 @@ from mstar.utils.generation_kwargs import normalize_generation_kwargs
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import watch_parent
 from mstar.utils.socket_prefix import per_port_socket_prefix
-from mstar.utils.threads import Thread, pin_thread
+from mstar.utils.threads import Thread, pin_thread, set_thread_util_min
 
 logger = logging.getLogger(__name__)
 
@@ -578,6 +578,7 @@ class APIServer:
         CPU each handoff wakes a core that is already running."""
         if self._result_cpu is not None:
             pin_thread({self._result_cpu}, self._process_cpus)
+        set_thread_util_min(knobs.step_thread_util_min())
 
     def finalize_setup(self) -> None:
         """Block until the conductor signals that every worker has finished

@@ -20,6 +20,7 @@ KNOBS: dict[str, str] = {
     "gc_gen0_threshold": "MSTAR_GC_GEN0_THRESHOLD",
     "pre_plan": "MSTAR_PRE_PLAN_SPEC",
     "step_thread_core": "MSTAR_STEP_THREAD_CORE",
+    "step_thread_util_min": "MSTAR_STEP_THREAD_UTIL_MIN",
     "compile_deterministic": "MSTAR_COMPILE_DETERMINISTIC",
     "idle_hold": "MSTAR_IDLE_HOLD",
     "resident_planning": "MSTAR_RESIDENT_PLANNING",
@@ -51,6 +52,8 @@ def check(settings: Mapping[str, object] | None) -> dict[str, str]:
             out[key] = _idle_hold_value(value)
         elif key == "resident_planning":
             out[key] = _resident_planning_value(value)
+        elif key == "step_thread_util_min":
+            out[key] = str(_step_thread_util_min_value(value))
         elif isinstance(value, bool):
             out[key] = "1" if value else "0"
         elif isinstance(value, int):
@@ -60,6 +63,15 @@ def check(settings: Mapping[str, object] | None) -> dict[str, str]:
                 f"`knobs: {key}` must be a bool or an integer, got {value!r}"
             )
     return out
+
+
+def _step_thread_util_min_value(value: object) -> int:
+    text = str(value).strip()
+    if not isinstance(value, bool) and text.isdigit() and int(text) <= 1024:
+        return int(text)
+    raise ValueError(
+        f"step_thread_util_min (MSTAR_STEP_THREAD_UTIL_MIN) must be an integer from 0 to 1024, got {value!r}"
+    )
 
 
 def _resident_planning_value(value: object) -> str:
@@ -211,6 +223,16 @@ def pre_plan_enabled() -> bool:
     4 layers), where the step is too short to hide the planning in and the
     extra thread is just GIL contention."""
     return _setting("pre_plan", "1") == "1"
+
+
+def step_thread_util_min() -> int:
+    """``step_thread_util_min`` / ``MSTAR_STEP_THREAD_UTIL_MIN`` (default 0): the
+    ``uclamp`` floor each worker's main, GPU and plan threads and the API
+    server's result threads ask the scheduler for, 0 to 1024; 0 leaves them
+    alone. Under the ``schedutil`` governor a step's threads, which sleep and
+    wake many times a step, read as lightly loaded and run far below the CPU's
+    top frequency, and 1024 asks for the top. See :func:`mstar.utils.threads.set_thread_util_min`."""
+    return _step_thread_util_min_value(_setting("step_thread_util_min", "0"))
 
 
 def step_thread_core() -> str | int:
