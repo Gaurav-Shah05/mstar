@@ -637,6 +637,12 @@ class Model(ABC):
     # conductor in arrival order. Declare it only once those calls are checked
     # for shared state, and for the GIL: work that holds it gains nothing here.
     PREPROCESS_PARALLEL: bool = False
+    # Also decode one request's images at once, on top of ``PREPROCESS_PARALLEL``.
+    # For a model whose ``load_image`` is mostly a decode that drops the GIL and
+    # that takes several images per request: intra-op work inside ``load_image``
+    # would run on each of these threads, beyond what the prepare pool is sized
+    # for.
+    PREPROCESS_PARALLEL_IMAGES: bool = False
 
     def _get_worker_graphs_for_graph_walk(
         self,
