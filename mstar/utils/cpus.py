@@ -23,9 +23,14 @@ the first holds a lock on it (``claim_gpus``) and the next pins nothing.
 """
 from __future__ import annotations
 
+import ctypes
 import fcntl
+import logging
 import math
 import os
+import platform
+import struct
+import sys
 from collections.abc import Callable, Collection, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +43,42 @@ _CPU_TOPOLOGY = "/sys/devices/system/cpu/cpu{}/topology/thread_siblings_list"
 _GPU_LOCK_DIR = Path("/tmp")
 
 PINNABLE = hasattr(os, "sched_setaffinity")
+
+logger = logging.getLogger(__name__)
+
+# sched_setattr(2): the syscall has no libc wrapper
+_SCHED_SETATTR = {"x86_64": 314, "aarch64": 274}
+_SCHED_FLAG_KEEP_POLICY_PARAMS = 0x18
+_SCHED_FLAG_UTIL_CLAMP_MIN = 0x20
+_SCHED_CAPACITY_SCALE = 1024
+
+
+def run_at_full_frequency() -> None:
+    """Ask the kernel to run this thread, and every thread and process started
+    from it, at full CPU frequency while runnable (``uclamp.min``).
+
+    A serving step hands off between threads and processes that sleep in
+    between. Under the ``schedutil`` governor a thread woken after about 10 ms
+    asleep runs up to 4x slower until the frequency ramps back up, so that
+    host time grows with every hand-off. This changes only the frequency a
+    runnable thread asks for; idle threads stay asleep. A kernel without
+    ``CONFIG_UCLAMP_TASK``, or a sandbox refusing the call, leaves the
+    governor's default, which is logged.
+    """
+    number = _SCHED_SETATTR.get(platform.machine()) if sys.platform == "linux" else None
+    if number is None:
+        logger.warning("CPU frequency: no uclamp request on %s %s", sys.platform, platform.machine())
+        return
+    # struct sched_attr: size, policy, flags, nice, priority, runtime, deadline, period, util_min, util_max
+    attr = struct.pack(
+        "IIQiIQQQII", 56, 0, _SCHED_FLAG_KEEP_POLICY_PARAMS | _SCHED_FLAG_UTIL_CLAMP_MIN,
+        0, 0, 0, 0, 0, _SCHED_CAPACITY_SCALE, 0,
+    )
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.syscall(number, 0, ctypes.c_char_p(attr), 0) != 0:
+        logger.warning("CPU frequency: uclamp request refused: %s", os.strerror(ctypes.get_errno()))
+        return
+    logger.info("CPU frequency: requested uclamp.min=%d for this deployment", _SCHED_CAPACITY_SCALE)
 
 
 # ── CPU lists ───────────────────────────────────────────────────────────────

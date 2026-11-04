@@ -2719,6 +2719,14 @@ async def shutdown_event():
 # CLI entry point
 # ------------------------------------------------------------------
 
+def apply_cpu_settings(config: dict) -> None:
+    """This deployment's CPU plan and frequency request, before any thread or
+    process of it starts, so they all inherit them."""
+    cpus.install(deployment_cpu_plan(config))
+    if knobs.full_cpu_frequency_enabled():
+        cpus.run_at_full_frequency()
+
+
 def deployment_cpu_plan(config: dict) -> cpus.CpuPlan:
     """The deployment's CPU plan, as each worker builds it from the conductor's
     device list: the config's ``step_thread_core`` and ``deployment_workers``.
@@ -2887,7 +2895,7 @@ def main(argv: list[str] | None = None):
     )
     # before any thread: the pools are sized from the CPUs it leaves unpinned
     try:
-        cpus.install(deployment_cpu_plan(config))
+        apply_cpu_settings(config)
     except cpus.CpuPlanError as e:
         raise SystemExit(f"mstar: {e}") from None
     _set_preprocess_threads(model, config)
