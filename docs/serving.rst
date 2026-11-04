@@ -780,9 +780,10 @@ host time spent waking CPUs. Two knobs deal with it:
 - ``step_thread_core`` pins those threads. ``always`` gives each worker three cores,
   one hardware thread of each, and the API server a core of its own. ``siblings``
   puts a worker's three threads on one core's hardware threads (two cores of an L2
-  cluster where there is no SMT), which keeps that core awake. ``auto`` pins nothing
-  and logs one line saying why for this host, since neither layout has beaten no pin
-  on every host it was measured on (table below). ``off`` never pins, a number names
+  cluster where there is no SMT), which keeps that core awake. ``auto`` takes
+  ``siblings`` on an Intel or AMD host with an idle state of 100 µs or more, for
+  devices with a PCI address, and elsewhere pins nothing and logs one line saying
+  why (table below; hosts differ, so measure a deployment that matters). ``off`` never pins, a number names
   the first worker's core. Under a job's mask too small for every GPU the container
   can open (8 cores on a node of four GPUs), ``always`` and ``siblings`` size by the
   GPUs the server was given, and a lock per core keeps servers that share ``/tmp``
@@ -817,18 +818,26 @@ to 8 cores (with their siblings where the CPU has SMT), medians over server sess
      - not measured
      - 419 / 5526 (an earlier ``auto``, the same layout)
      - not measured
-   * - H200, 2-socket AMD EPYC (C2 800 µs), 16-CPU mask
+   * - H200, 2-socket AMD EPYC (C2 800 µs), 16-CPU mask, measured earlier
      - 634 / 3617
      - not measured
      - 506 / 3103 (an earlier ``auto``, the same layout)
      - not measured
+   * - H200, 2-socket EPYC 9554 (C2 800 µs), 16-CPU mask, ``--rust-frontend``, ``-O1``, c=1 / 16
+     - 442 / 4249
+     - not measured
+     - 919 / 8444
+     - 865 / 8151, no pin
 
 The last column is a ``SCHED_IDLE`` spinner on each server CPU, a stand-in for
 ``idle_hold: qos`` where the device is hidden: the hold itself has not been measured.
 With the cores held awake, ``siblings`` loses to no pin and three separate cores are
 level with it, so ``auto`` names the hold first when it is set.
 
-Pinning has other costs. ``siblings`` on the 6740E raised 0.8B's time to first token
+Pinning has other costs. A faster worker can saturate the Python frontend: 0.8B on the
+EPYC at c=64 went from 69 to about 480 ms to first token there (26 ms on the Rust
+frontend), and pinning the frontend's threads or not made no difference; such a
+deployment wants ``--rust-frontend`` or ``off``. ``siblings`` on the 6740E raised 0.8B's time to first token
 at high concurrency (c=64 67 → 86 ms) while raising its throughput, and FLUX.2 klein
 at c=1 lost about 12% there (c=8 level). A low-duty model with eager host work can
 leave it ``off``.

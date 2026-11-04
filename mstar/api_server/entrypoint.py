@@ -2769,7 +2769,7 @@ async def shutdown_event():
 def deployment_cpu_plan(config: dict) -> cpus.CpuPlan:
     """The deployment's CPU plan, as each worker builds it from the conductor's
     device list: the config's ``step_thread_core`` and ``deployment_workers``.
-    Placing by rank (``always``, ``siblings``) also takes the GPUs' locks, and
+    Placing by rank (``always``, ``siblings``, ``auto`` when it pins) also takes the GPUs' locks, and
     any plan that pins takes its cores' locks, moving to the next core set
     the mask holds when one is held; a server that finds a GPU held, or no set
     free, pins nothing, here or in its workers. A bad knob value is left for the
@@ -2786,7 +2786,7 @@ def deployment_cpu_plan(config: dict) -> cpus.CpuPlan:
     plan = cpus.devices_plan(setting, devices, knobs.idle_hold(), slot=0)
     if not plan.pinned:
         return plan
-    refused = cpus.claim_gpus(cpus.device_addresses(devices)) if setting in cpus.PLACED else None
+    refused = cpus.claim_gpus(cpus.device_addresses(devices)) if setting in (*cpus.PLACED, "auto") else None
     if refused is None:
         plan = cpus.claim_cores(plan, lambda slot: cpus.devices_plan(setting, devices, knobs.idle_hold(), slot=slot))
         if plan.pinned:

@@ -499,18 +499,18 @@ Worker scheduling
        ``siblings`` puts each worker's three threads on all hardware threads
        of one core instead (two cores of one L2 cluster,
        ``topology/cluster_cpus_list``, where a core has one CPU in the mask);
-       ``cpus._siblings`` has its numbers. On a deep-idle Xeon 6767P it beat
-       no pin and three separate cores; on two H200 hosts with SMT it lost to
-       no pin.
-       ``auto`` pins nothing and logs one line saying why for this host, since
-       no host it can tell apart has a measurement in which a layout beats no
-       pin: ``idle_hold`` is set (with the cores held awake pinning measured
-       no faster), the CPU vendor isn't Intel (``cpus.AUTO_VENDORS``, by
+       ``cpus._siblings`` has its numbers. On a deep-idle Xeon 6767P and EPYC
+       9554 it beat no pin and three separate cores (on the EPYC, at c=64); two
+       other H200 hosts with SMT measured it behind no pin earlier.
+       ``auto`` is ``siblings``, unless it pins nothing and logs one line saying
+       why: ``idle_hold`` is set (with the cores held awake pinning measured
+       no faster), the CPU vendor is neither Intel nor AMD (``cpus.AUTO_VENDORS``, by
        ``/proc/cpuinfo``'s ``vendor_id``), no enabled idle state of 100 µs or
        more shows on a CPU of the process mask
        (``/sys/devices/system/cpu/cpu*/cpuidle/state*/latency``,
-       ``cpus.deepest_idle``, ``cpus.DEEP_IDLE_US``), or, on a deep-idle Intel
-       host, three separate cores measured no faster than no pin.
+       ``cpus.deepest_idle``, ``cpus.DEEP_IDLE_US``), a device has no PCI address
+       (a CPU or XPU worker), or the mask can't hold the layout. A second server
+       on the GPU, or one that finds its cores locked, pins nothing as it does under ``siblings``.
        A number names the first worker's core (its hardware threads in the
        mask); the next workers take the next cores up and the API server the
        last core of the mask. A number outside the mask, or too near its top
@@ -538,7 +538,7 @@ Worker scheduling
        that sized the plan. Short of that too, or with a mask too small to
        leave a CPU unpinned, nothing is pinned and a warning says why.
        Servers on one GPU (two MIG instances share its address) would take
-       the same CPUs, so the first ``always`` or ``siblings`` server holds
+       the same CPUs, so the first server that places by rank holds
        ``/tmp/mstar-gpu-<PCI address>.lock`` for its life and a second one
        pins nothing, with a warning. Every server that pins, a CPU number
        included, also holds ``/tmp/mstar-core-<CPU>.lock`` for each physical

@@ -32,12 +32,11 @@ finds a set held takes the next.
 
 Pinning can pay where a thread woken on an idle core waits for that core to
 leave a deep idle state, and costs throughput where it doesn't, since the
-threads only queue on their CPUs. Which layout pays depends on the host: on a
-deep-idle Xeon one core's hardware threads beat no pin and separate cores lost
-to it, while one core's hardware threads lost on two H200 hosts. So ``auto``
-pins nothing and logs why (``_auto_declines``): the reason names the idle hold,
-a CPU vendor other than Intel, idle states under ``DEEP_IDLE_US``
-(``deepest_idle``), or what the separate cores measured.
+threads only queue on their CPUs. So ``auto`` takes ``siblings`` where a CPU of
+the mask has an idle state of ``DEEP_IDLE_US`` or more, on the vendors it is
+measured on and devices sysfs places. Elsewhere it pins nothing and logs why
+(``_auto_declines``): the reason names the idle hold, another CPU vendor, idle
+states under ``DEEP_IDLE_US`` (``deepest_idle``), or a device with no PCI address.
 """
 from __future__ import annotations
 
@@ -81,8 +80,8 @@ STEP_CORES = 3
 # CPU latency the idle hold asks for: admits C1 and C1E, refuses the C6 class
 IDLE_HOLD_US = 10
 # ``/proc/cpuinfo`` vendors ``auto``'s measurements come from (Xeon 6767P and
-# 6740E hosts); elsewhere its reason says so rather than quote them
-AUTO_VENDORS = ("GenuineIntel",)
+# 6740E, EPYC 9554); elsewhere it pins nothing and its reason says so
+AUTO_VENDORS = ("GenuineIntel", "AuthenticAMD")
 
 
 # ── CPU lists ───────────────────────────────────────────────────────────────
@@ -372,9 +371,11 @@ def _siblings(cores: list[tuple[int, ...]], cluster: Callable[[int], frozenset[i
     with no pin and 526 / 3851 on three cores of their own; Xeon 6740E (no SMT,
     four cores to an L2 cluster) 527 / 3635 against 371 / 2688. With a
     ``SCHED_IDLE`` spinner holding the 6767P's cores awake it lost at c=1, 753
-    against 906 with no pin. On two H200 hosts with SMT it lost to no pin: c=1
-    506 against 634 on a 2-socket AMD EPYC (C2 at 800 µs), 13-26% at c=1-32 on
-    the other. So ``auto`` never takes it."""
+    against 906 with no pin. A 2-socket EPYC 9554 (C2 at 800 µs), an H200, c=1 /
+    c=16 / c=64: 885 / 8108 / 15188 against 472 / 4336 / 8001 with no pin; no pin
+    with a spinner holding each server CPU awake gets most of that. Two other
+    H200 hosts measured the reverse earlier (c=1 506 against 634 on a 2-socket
+    EPYC, 13-26% at c=1-32 on the other), not repeated since."""
     return [_Unit(unit, tuple(core for core in cores if core[0] in unit)) for unit in _paired(cores, cluster)]
 
 
@@ -472,12 +473,14 @@ def deployment_plan(
 ) -> CpuPlan:
     """The plan for a deployment whose workers' devices sit at PCI
     ``addresses``, in the conductor's worker order (None for a device sysfs
-    doesn't place, such as a CPU worker; only ``always`` and ``siblings``
-    read them), ``reachable`` the GPUs this container can open, ``own`` the
+    doesn't place, such as a CPU worker; a plan that doesn't place by rank
+    ignores them), ``reachable`` the GPUs this container can open, ``own`` the
     ones this process was given, and ``slot`` the core set to take when the
     mask holds more than one (``claim_cores``).
 
-    ``off`` pins nothing, and ``auto`` pins nothing and says why. A CPU number
+    ``off`` pins nothing. ``auto`` is ``siblings`` where ``_auto_declines`` finds
+    no reason against it and every device has an address, and otherwise pins
+    nothing and says why. A CPU number
     is the first worker's core; the next workers take the next cores above it,
     and the API server the last core of the mask; a number outside the mask,
     or too near its top for every worker, raises ``CpuPlanError``. ``always``
@@ -491,9 +494,15 @@ def deployment_plan(
         return CpuPlan(mask, usable, why="step_thread_core off")
     if not PINNABLE:
         return CpuPlan(mask, usable, why="not pinned: no sched_setaffinity here")
+    auto = False
     if setting == "auto":
         declined = _auto_declines(idle_hold, cpu_vendor(cpuinfo), mask, cpu_root)
-        return CpuPlan(mask, usable, why=f"not pinned: {declined}", declined=True)
+        if declined is not None:
+            return CpuPlan(mask, usable, why=f"not pinned: {declined}", declined=True)
+        if None in addresses or not addresses:
+            return CpuPlan(mask, usable, why="not pinned: auto needs a PCI address for every device (step_thread_core "
+                                             "always pins anyway)", declined=True)
+        auto, setting = True, "siblings"
     cores = _cores(mask, siblings)
     if setting in PLACED:
         def cores_of(cpus: Collection[int]) -> list[tuple[int, ...]]:
@@ -508,7 +517,7 @@ def deployment_plan(
                                       "server)")
         placed = _by_rank(setting, addresses, mask, cores_of, layout, pci_root, reachable, own, slot)
         if isinstance(placed, str):
-            return CpuPlan(mask, usable, why=f"not pinned: {placed}")
+            return CpuPlan(mask, usable, why=f"not pinned: {placed}", declined=auto)
         workers, result, why, sets = placed
     else:
         workers, result, why = _explicit(int(setting), len(addresses), mask, cores)
@@ -518,28 +527,27 @@ def deployment_plan(
         reason = (f"{len(addresses)} worker(s) and the API server would pin all {len(mask)} CPU(s) "
                   f"of the process mask {format_cpu_list(mask)}, leaving none for the rest")
         if setting in PLACED:
-            return CpuPlan(mask, usable, why=f"not pinned: {reason}")
+            return CpuPlan(mask, usable, why=f"not pinned: {reason}", declined=auto)
         raise CpuPlanError(f"step_thread_core {setting}: {reason}")
     return out
 
 
-def _auto_declines(idle_hold: str, vendor: str | None, mask: frozenset[int], cpu_root: Path) -> str:
-    """Why ``auto`` leaves this host's threads alone. No host it can tell
-    apart has a measurement in which its layout beats no pin yet, so the
-    answer is never None; the reason names what the host has."""
+def auto_pins(idle_hold: str = "off") -> bool:
+    """Whether ``auto`` would place threads on this host, so its plan needs
+    the devices' addresses."""
+    return _auto_declines(idle_hold, cpu_vendor(), frozenset(process_mask()), _CPU_ROOT) is None
+
+
+def _auto_declines(idle_hold: str, vendor: str | None, mask: frozenset[int], cpu_root: Path) -> str | None:
+    """Why ``auto`` leaves this host's threads alone; None when it pins them."""
     anyway = "step_thread_core always pins anyway"
     if idle_hold != "off":
         return (f"idle_hold {idle_hold} keeps the cores out of deep idle, where pinning measured no faster than none "
                 f"({anyway})")
     if vendor not in AUTO_VENDORS:
         this = f"this host's is {vendor}" if vendor else "/proc/cpuinfo names no vendor here"
-        return f"auto is measured on Intel hosts only and {this} ({anyway})"
-    shallow = _no_deep_idle(mask, cpu_root)
-    if shallow is not None:
-        return shallow
-    return (f"on an Intel host whose cores sleep deep, the step threads on {STEP_CORES} cores of their own measured "
-            f"no faster than no pin; step_thread_core siblings, one core's hardware threads, measured faster there "
-            f"but lost on other hosts ({anyway})")
+        return f"auto is measured on {' and '.join(AUTO_VENDORS)} hosts only and {this} ({anyway})"
+    return _no_deep_idle(mask, cpu_root)
 
 
 def _no_deep_idle(mask: frozenset[int], cpu_root: Path) -> str | None:
@@ -691,8 +699,8 @@ def devices_plan(setting: str | int, devices: Sequence[str], idle_hold: str = "o
     """``deployment_plan`` for the workers' device strings, in the conductor's
     worker order: the same call in the API server and in every worker. A
     worker takes the core set its API server locked (``CORE_SET_ENV``)."""
-    # auto, which pins nothing, never asks torch about the devices
-    if setting not in PLACED:
+    # what pins nothing never asks torch about the devices
+    if setting not in PLACED and not (setting == "auto" and auto_pins(idle_hold)):
         return deployment_plan(setting, [None] * len(devices), idle_hold=idle_hold)
     from mstar.platforms import current_platform
 

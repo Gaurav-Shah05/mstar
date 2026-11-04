@@ -219,8 +219,9 @@ def step_thread_core() -> str | int:
     threads, to CPUs of their own. ``always`` places them by the GPU's rank on
     its NUMA node, a worker's three on three cores of their own;
     ``siblings`` places them the same way with a worker's three on one core's
-    hardware threads; a number is the first worker's core. ``auto`` pins
-    nothing and logs why for this host (see ``mstar.utils.cpus``)."""
+    hardware threads; a number is the first worker's core. ``auto`` is
+    ``siblings`` where cores sleep deep, and elsewhere pins nothing and logs
+    why (see ``mstar.utils.cpus``)."""
     value = _setting("step_thread_core", "auto").strip().lower()
     if value in ("auto", "always", "siblings", "off"):
         return value
