@@ -814,11 +814,13 @@ class PreprocessWorkerThread:
         return cpus.plan().prepare_workers(torch.get_num_threads())
 
     def _num_decode_workers(self) -> int:
-        """One request's images decoded at once. A deployment preparing inline
+        """One request's images decoded at once, as many as requests prepare at
+        once: a decode has no intra-op work, so these threads don't multiply by
+        the process's intra-op count. A deployment preparing inline
         (``preprocess_workers: 1``) gets no overlap from this pool either."""
         if not getattr(self.model, "PREPROCESS_PARALLEL_IMAGES", False) or self._prepare_workers <= 1:
             return 1
-        return cpus.plan().preprocess_threads
+        return self._prepare_workers
 
     def _cleanup_request_state(self, request_id: str, *, force: bool = False) -> None:
         """Release transport and postprocessing state owned by this thread.
