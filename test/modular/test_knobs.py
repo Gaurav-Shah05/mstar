@@ -85,3 +85,21 @@ def test_idle_hold_from_the_config_and_the_environment(monkeypatch):
 def test_a_bad_idle_hold_fails_the_startup_check(value):
     with pytest.raises(ValueError, match="idle_hold"):
         knobs.check({"idle_hold": value})
+
+
+def test_step_thread_util_min_from_the_config_and_the_environment(monkeypatch):
+    assert knobs.step_thread_util_min() == 0
+    knobs.configure({"step_thread_util_min": 1024})
+    assert knobs.step_thread_util_min() == 1024
+    monkeypatch.setenv("MSTAR_STEP_THREAD_UTIL_MIN", "512")
+    assert knobs.step_thread_util_min() == 512
+    for bad in ("1025", "-1", "max"):
+        monkeypatch.setenv("MSTAR_STEP_THREAD_UTIL_MIN", bad)
+        with pytest.raises(ValueError, match="MSTAR_STEP_THREAD_UTIL_MIN"):
+            knobs.step_thread_util_min()
+
+
+@pytest.mark.parametrize("value", [1025, -1, "max", True])
+def test_a_bad_step_thread_util_min_fails_the_startup_check(value):
+    with pytest.raises(ValueError, match="step_thread_util_min"):
+        knobs.check({"step_thread_util_min": value})
