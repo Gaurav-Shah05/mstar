@@ -77,6 +77,9 @@ class _Engine:
     def __init__(self, max_bs):
         self.max_bs = max_bs  # an int for every walk, or walk -> int
 
+    def get_gather_policy(self, node_name, graph_walk):
+        return None
+
     def get_max_batch_size(self, node_name, graph_walk):
         return self.max_bs.get(graph_walk) if isinstance(self.max_bs, dict) else self.max_bs
 

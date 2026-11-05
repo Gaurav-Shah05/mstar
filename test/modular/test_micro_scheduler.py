@@ -276,6 +276,9 @@ class _Engine:
         del node_name, graph_walk
         return self.order
 
+    def get_gather_policy(self, node_name, graph_walk):
+        return None
+
     def get_max_batch_size(self, node_name, graph_walk):
         del node_name
         if isinstance(self._max_bs, dict):
