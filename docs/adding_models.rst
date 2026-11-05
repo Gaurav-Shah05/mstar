@@ -1940,6 +1940,11 @@ into one GPU call. A submodule controls this behavior with these methods:
   When a batch runs, the engine calls this method instead of the single-request
   ``forward``.
 - ``max_batch_size(self, graph_walk)`` sets an optional upper limit.
+- ``gather_policy(self, graph_walk) -> GatherPolicy | None`` lets ready rows wait for company:
+  while the worker holds ``busy_requests`` requests, the walk waits until ``rows`` rows are ready
+  or ``wait_s`` has passed, then runs. It trades time to first token under load for fewer steps,
+  and suits a cheap node whose rows each cost a heavier consumer a step (Qwen3-Omni's audio
+  encoder ahead of the Thinker). The default, ``None``, runs rows at once.
 - ``step_order(self, graph_walk) -> StepOrder`` says who runs first when more rows are ready
   than ``max_batch_size`` allows. The default, ``StepOrder.ARRIVAL``, is first come, first served
   to completion: the requests holding the step keep it, then the request that arrived first.

@@ -85,6 +85,7 @@ from mstar.model.submodule_base import (
     ARNodeSubmodule,
     BatchedModelOutput,
     DeviceLoopback,
+    GatherPolicy,
     InputMetadata,
     InputSeqLenInfo,
     ModelInputsFromEngine,
@@ -137,6 +138,11 @@ class AudioEncoderSubmodule(AuTEncoderSubmodule):
     def __init__(self, audio_encoder: AuTEncoder, config: Qwen3OmniModelConfig):
         super().__init__(audio_encoder, attn_key=AUDIO_ATTN)
         self.config = config
+
+    def gather_policy(self, graph_walk: str) -> GatherPolicy | None:
+        # Each clip's prompt row costs the Thinker most of a mixed step of its own,
+        # so a clip is worth holding back for a few others once the server is busy.
+        return GatherPolicy(rows=self.MAX_BATCH_SIZE, wait_s=0.030, busy_requests=16)
 
     def prepare_inputs(
         self,
