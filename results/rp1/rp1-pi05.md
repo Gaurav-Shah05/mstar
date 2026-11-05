@@ -2,6 +2,14 @@
 
 Base: run-base e8826a777. GPU: 1x H200. Headline: action-chunk latency p50 at c=1 (configs/pi05_droid.yaml, horizon 15).
 
+## Current state (2026-11-05 05:05 UTC; machine offline 06:00-18:00Z)
+
+- Best on run-base: perf/rp1-pi05 at 3444a8779. c=1 p50 about 38-39 ms (run-base about 106).
+- Side task done: perf/rp1-main at 8adf90628, gated, checkpoint reported; see On main.
+- Not kept, closest candidate: H28, branch perf/rp1-h28 (WIP commit on top of 3444a8779). Not on perf/rp1-pi05 and not on perf/rp1-main.
+- GPU idle, nothing running. /loop/deadline set to 1793982000.
+- On return: check /workspace survived; if not, restore from perf/rp1-results (results/rp1/, tools/ holds the harness, ref/ the reference actions) and rebuild the venvs and droid-cache. A new variant of H28 that gains more at c=1 is the next round, since any H28 re-run is only worth it with a real change: per-node bucket padding for the ~930-token prefix, or cutting the 2.3 ms client-side and 0.9 ms worker hops. Then take the c=8 mean: H28 p50 99.5 but mean about 109, so some rows run slow (not diagnosed).
+
 ## On main (status 2026-11-05 00:45 UTC; branch perf/rp1-main at 9c6f1ad75, venv /workspace/venv-main)
 
 - **Ported, 16 commits, tip 8adf90628.** Clean or re-applied: H1 (e5c965b86, 21b44460a), H7 (916cbe8e8, ab0f7334e), H5 (dad5d3d54, 757504468), H9 (700af99c9, 6dc2301aa), H20 (3f3622549, 8b585ecaa, body notes the overlap with rp2's 444a2399), P1 (b3c9bbebc, 98f5f3677), H23 (5a282cbdb, 8adf90628).
@@ -42,7 +50,7 @@ Base: run-base e8826a777. GPU: 1x H200. Headline: action-chunk latency p50 at c=
 - AUDIT done: H9 and H5 both passed the literal rule. Qwen3.5 A/B of H20 (other_model_h20.sh) queued; chain8.sh had not been running.
 - P1 concurrent decode: KEPT (0d887ae5e, aeda84155), -1.6 ms.
 - H23 decode pool sized for the cameras: KEPT (833bc8acb, 3444a8779), about -1 ms.
-- H28 (next, after the main port): H27's c=8 loss. H27 gets c=1 36-37 ms in 2 of 3 rounds and c=4 p50 71 vs 78, but c=8 throughput 46-60 vs 72 and p99 up. Find why (hypothesis, unverified: rows batch less well once the action step follows prefill directly). Patch: rp1-pi05-tools/h27.patch. Best: 3444a8779.
+- H28: FAILED the keep rule by 0.11 ms in one c=1 round, strong at c=4 and c=8; on branch perf/rp1-h28 as WIP. See Current state.
 - Not queued, see proposals status update: P2 (no candidate at this resolution), P3 one walk (needs engine work, bound about 2 ms), P4 (rp3), H11, H12 (under the resolution limit). H13: H24 shows no kernel gain.
 
 API path at 6eba3b986, c=1, trace_clean2 (173 requests, E2E p50 37 ms): first form parse 0.74; form -> prepare start 1.24; media 5.34; prepare tail 0.31; prepare end -> ViT prep 2.26; ViT 4.30 (GPU 3.2); prefill 8.72 (GPU 7.27); switch 0.39; action 11.35 (GPU 9.92); residual client/response ~2.4. Upload file I/O on /tmp is negligible (write 0.057, read 0.021 ms per 95 KB PNG), so removing the upload files is not a candidate.
@@ -451,4 +459,17 @@ API path at 6eba3b986, c=1, trace_clean2 (173 requests, E2E p50 37 ms): first fo
 - c=4: all 39 of H27's 2-row prefills ran eager at 47.6 ms host, against 0.9 ms captured: two ~930-token prefixes exceed the 1800 bucket. c=8: every H27 3-4 row prefill eager, 24-27 ms host; best's eager steps 14-35 ms.
 - H28: H27 plus prefill buckets from the longest prefix. a: [512, 968, 1936]; b: adds 3872. Both probed with bs_probe.sh.
 - H28 probes (logs/h28.out): a [512,968,1936] c=4 p50 70.39 p99 86.45 thr 56.80, c=8 p50 91.89 p99 263.47 thr 67.65, 3-4 row prefills still eager (22.9, 36.8 ms). b [512,968,1936,3872] c=4 p50 70.41 p99 86.79 thr 56.67, c=8 p50 99.74 p99 146.18 thr 71.30, every prefill captured. best, same harness: c=4 p50 80.91 p99 127.20 thr 48.55, c=8 p50 107.93 p99 146.39 thr 72.11. Taking b to paired rounds (p_h28), then concurrent gate. Queue is timed to end before 05:45Z.
+
+### p_h28: H27 plus prefill buckets [512, 968, 1936, 3872] — FAIL by 0.11 ms, not kept
+- hypothesis: H27's tail is eager prefills past the 1800 bucket (profile above); capturing them fixes c=4 and c=8 and keeps the c=1 gain.
+- `pair_round.sh p_h28 <3444a8779> <3444a8779+h28b.patch> pi05_droid.yaml 3` (03:51-04:59 UTC); WIP commit on branch perf/rp1-h28.
+  c=1 base: p50 [38.72, 38.76, 38.94] thr [25.69, 25.7, 25.55]
+  c=1 cand: p50 [38.83, 36.22, 37.9] thr [25.74, 27.39, 26.28]
+  c=4 base: p50 [78.57, 79.97, 78.74] thr [50.65, 49.79, 50.5]
+  c=4 cand: p50 [72.47, 71.26, 71.18] thr [54.33, 55.55, 55.69]
+  c=8 base: p50 [104.72, 111.36, 106.1] thr [73.13, 69.41, 71.83]
+  c=8 cand: p50 [99.55, 99.5, 99.56] thr [70.43, 70.39, 70.04]
+- c=1: candidate's 38.83 exceeds base's 38.72, so not all candidate rounds beat all base rounds. Means 37.65 vs 38.81. c=4 better with non-overlapping rounds, p99 88-91 vs 86-89. c=8 p50 better, throughput overlaps, mean latency about 109 vs 105-112.
+- gate PASS all rounds; concurrent gate PASS at c=1, 4, 8, 16 (max 0.0235); all captures ok.
+- decision: not kept, under the literal rule. No re-run: another run of the same change would only be fishing for a pass.
 
