@@ -139,14 +139,13 @@ class LLMSubmodule(ARNodeSubmodule):
         ).split(",")
     ]
 
-    # Text plus image tokens of a whole prompt. Capped at 4096, not the
+    # Text plus image tokens of a whole prompt. Capped at 8192, not the
     # processor's 16384, because static buffers are sized by the largest
-    # bucket; a longer prompt runs eagerly.
-    PREFILL_VISION_TOKEN_BUCKETS = [64, 128, 256, 512, 1024, 2048, 4096]
-    # Requests per `prefill_vision` step, so a packed step stays inside the
-    # 4096-token top bucket: 4 fit ~1000 tokens a request (a ~1000 px square
-    # image plus text). Past the top bucket the step runs eagerly and every
-    # new packed length recompiles. Chunked prefill replaces this cap.
+    # bucket; a longer prompt runs eagerly, where it can compile with every row in
+    # flight waiting (~5.6 s on Qwen3.5-2B, H200, for a 5360-token image).
+    PREFILL_VISION_TOKEN_BUCKETS = [64, 128, 256, 512, 1024, 2048, 4096, 8192]
+    # Requests per `prefill_vision` step: 4 fit ~1000 tokens a request (a ~1000 px
+    # square image plus text) in the 4096 bucket. Chunked prefill replaces this cap.
     PREFILL_VISION_MAX_BATCH_SIZE = 4
     PREFILL_VISION_CAPTURE_BATCH_SIZES = [1, 2, 4]
 
@@ -726,8 +725,8 @@ class VisionEncoderSubmodule(NodeSubmodule):
     other steps, it gets a step of its own (`cg_key_info`).
     """
 
-    # Patch-count buckets of one replay. 16384 patches merge to the LLM's
-    # 4096 `prefill_vision` bucket; a larger step runs uncaptured. 12288 holds a
+    # Patch-count buckets of one replay. 16384 patches merge to 4096 of the LLM's
+    # `prefill_vision` tokens; a larger step runs uncaptured. 12288 holds a
     # 30 s video at 2 fps (~11.8k patches), which 16384 pads by 39%.
     BLOCK_LOOP_PATCH_BUCKETS = [256, 512, 1024, 2048, 4096, 8192, 12288, 16384]
     # Requests per encoder step. They share one replay, so a burst of image
