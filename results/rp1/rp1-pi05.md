@@ -446,3 +446,8 @@ API path at 6eba3b986, c=1, trace_clean2 (173 requests, E2E p50 37 ms): first fo
 - Deviation: perf/rp1-results is refreshed with new commits rather than amending one, so the branch only moves forward and every push lands (the brief says refresh that commit, and never to force-move a branch). It also holds the harness scripts, patches and reference actions, since /workspace may not come back.
 - Main port gate on unported main, base15 config: FAIL max 1.400 (logs/main_gate/base15_base). Main checkpoint reported; see On main.
 
+### H27 c=8 profile (bs_probe.sh, rp1_bs.py, logs/bs; one server, 192 requests per concurrency, fresh arms)
+- Hypothesis that rows batch less under one walk: REFUTED. c=8 prefill batch sizes: H27 3-4 rows (55 of 60 steps); best 2-3 rows (64 of 84 logical).
+- c=4: all 39 of H27's 2-row prefills ran eager at 47.6 ms host, against 0.9 ms captured: two ~930-token prefixes exceed the 1800 bucket. c=8: every H27 3-4 row prefill eager, 24-27 ms host; best's eager steps 14-35 ms.
+- H28: H27 plus prefill buckets from the longest prefix. a: [512, 968, 1936]; b: adds 3872. Both probed with bs_probe.sh.
+

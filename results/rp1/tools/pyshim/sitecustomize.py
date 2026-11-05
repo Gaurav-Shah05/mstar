@@ -256,3 +256,7 @@ if os.environ.get("RP1_HOPS_DIR"):
 # Diagnostic only: per-step plan contents (rp1_planlog.py).
 if os.environ.get("RP1_PLANLOG_DIR"):
     import rp1_planlog  # noqa: F401
+
+# Diagnostic only: per-step node and batch size (rp1_bs.py).
+if os.environ.get("RP1_BS_DIR"):
+    import rp1_bs  # noqa: F401

@@ -1,0 +1,526 @@
+diff --git a/configs/pi05.yaml b/configs/pi05.yaml
+index 68dd60130..2ff4f679d 100644
+--- a/configs/pi05.yaml
++++ b/configs/pi05.yaml
+@@ -17,5 +17,6 @@ node_groups:
+ 
+   - node_names:
+       - LLM
++      - action_expert
+     ranks:
+       - 0
+diff --git a/configs/pi05_droid.yaml b/configs/pi05_droid.yaml
+index 8ecbc611e..f6f0c6b5b 100644
+--- a/configs/pi05_droid.yaml
++++ b/configs/pi05_droid.yaml
+@@ -40,5 +40,6 @@ node_groups:
+ 
+   - node_names:
+       - LLM
++      - action_expert
+     ranks:
+       - 0
+diff --git a/mstar/engine/engine.py b/mstar/engine/engine.py
+index a07bcf7d2..b01f57598 100644
+--- a/mstar/engine/engine.py
++++ b/mstar/engine/engine.py
+@@ -4,6 +4,7 @@ import logging
+ import os
+ import threading
+ import time
++from collections.abc import Iterable
+ from contextlib import contextmanager, nullcontext
+ from dataclasses import dataclass, field
+ from itertools import repeat
+@@ -160,6 +161,24 @@ class _MeasuredRow(NamedTuple):
+     custom_pos_ids: None = None
+ 
+ 
++class SlotRotation:
++    """Which double-buffer slot the next step takes. Leased from the plan thread
++    and the GPU thread both, hence the lock."""
++
++    __slots__ = ("next_slot", "num_slots", "_lock")
++
++    def __init__(self) -> None:
++        self.next_slot = 0
++        self.num_slots = 1
++        self._lock = threading.Lock()
++
++    def lease(self) -> int:
++        with self._lock:
++            slot = self.next_slot
++            self.next_slot = (self.next_slot + 1) % self.num_slots
++            return slot
++
++
+ @dataclass
+ class SubmoduleManagement:
+     submodule: NodeSubmodule
+@@ -178,14 +197,10 @@ class SubmoduleManagement:
+ 
+     # Rotated globally, not per runner: slot-keyed buffers are shared across
+     # buckets and regions, so per-runner counters let consecutive steps collide
+-    # on a slot. Leased from the plan thread and the GPU thread both, hence the
+-    # lock.
+-    _next_slot: int = field(init=False, default=0)
+-    _num_slots: int = field(init=False, default=1)
++    # on a slot. Nodes that share a resource share this too (see
++    # `share_slot_rotations`), for the same reason.
++    _slots: "SlotRotation" = field(init=False, repr=False)
+     _forced_double_buffer: bool = field(init=False, default=False)
+-    _slot_lock: threading.Lock = field(
+-        init=False, default_factory=threading.Lock, repr=False
+-    )
+ 
+     # label -> PiecewiseCudaGraphRunner for inner-loop capture; spread into
+     # ModelInputsFromEngine so the submodule's forward can look them up
+@@ -194,6 +209,7 @@ class SubmoduleManagement:
+     )
+ 
+     def __post_init__(self):
++        self._slots = SlotRotation()
+         # Two hazards want a second slot, both of them the host running ahead of
+         # the GPU: pre-plan needs plan(N+1) to write buffers replay(N) isn't
+         # reading, and ``force_double_buffer`` is the same for a resource
+@@ -211,10 +227,9 @@ class SubmoduleManagement:
+             and any(res.supports_preplan for res in self.resources.values())
+         )
+         if not double_buffered:
+-            self._num_slots = 1
+             return
+-        self._num_slots = int(os.environ.get("MSTAR_NUM_SLOTS", "2"))
+-        if self._num_slots < 2:
++        self._slots.num_slots = int(os.environ.get("MSTAR_NUM_SLOTS", "2"))
++        if self._slots.num_slots < 2:
+             # MSTAR_NUM_SLOTS=1 is the knob for turning double-buffering off,
+             # but neither hazard has a single-buffered form: one slot puts the
+             # next step's staging on top of a DMA that may not have retired.
+@@ -222,13 +237,13 @@ class SubmoduleManagement:
+             # MSTAR_PRE_PLAN_SPEC=0) to drop to a single slot.
+             logger.warning(
+                 "MSTAR_NUM_SLOTS=%d, but a resource on this node needs "
+-                "double-buffering; using 2 slots.", self._num_slots,
++                "double-buffering; using 2 slots.", self._slots.num_slots,
+             )
+-            self._num_slots = 2
++            self._slots.num_slots = 2
+ 
+     @property
+     def num_slots(self) -> int:
+-        return self._num_slots
++        return self._slots.num_slots
+ 
+     @property
+     def needs_slot_fence(self) -> bool:
+@@ -241,13 +256,10 @@ class SubmoduleManagement:
+         """The slot the next lease hands out. Read unlocked: an int read is
+         atomic under the GIL, and the only other leaser is the plan thread,
+         which is gated on the previous batch's ``commit_done``."""
+-        return self._next_slot
++        return self._slots.next_slot
+ 
+     def lease_slot(self) -> int:
+-        with self._slot_lock:
+-            slot = self._next_slot
+-            self._next_slot = (self._next_slot + 1) % self._num_slots
+-            return slot
++        return self._slots.lease()
+ 
+     def set_piecewise_slot(self, slot: int) -> None:
+         """Point the region runners at this batch's slot, on the GPU thread just
+@@ -257,6 +269,28 @@ class SubmoduleManagement:
+         for runner in self.piecewise_runners.values():
+             runner.set_slot(slot)
+ 
++def share_slot_rotations(submodules: Iterable[SubmoduleManagement]) -> None:
++    """Give nodes that share a resource one slot rotation.
++
++    Resources key buffers by slot (`KVManager._static_plan_state`, FlashInfer's
++    workspaces), and pre-plan writes the next step's slot while the current
++    step's graph reads its own. Two nodes rotating apart can land on one slot,
++    and the pre-plan then overwrites what the running graph is reading.
++    """
++    by_resource: dict[int, SubmoduleManagement] = {}
++    for mgmt in submodules:
++        for resource in mgmt.resources.values():
++            first = by_resource.setdefault(id(resource), mgmt)
++            if first._slots is not mgmt._slots:
++                merged = first._slots
++                merged.num_slots = max(merged.num_slots, mgmt._slots.num_slots)
++                old = mgmt._slots
++                for other in by_resource.values():
++                    if other._slots is old:
++                        other._slots = merged
++                mgmt._slots = merged
++
++
+ @dataclass
+ class ForwardPassInfoWrapper:
+     """
+@@ -673,6 +707,7 @@ class Engine:
+                 # the sampler keeps its slot masters only for a node that
+                 # reads them back on the device (see DeviceLoopback)
+                 resources[loopback.sampler].enable_device_loopback_reader()
++        share_slot_rotations(self._submodules.values())
+ 
+     def paged_kv_caches(self) -> list[PagedKVCache]:
+         """Every paged KV cache this engine built, with the nodes that use it."""
+diff --git a/mstar/model/pi05/config.py b/mstar/model/pi05/config.py
+index 1afc00d2e..44350211b 100644
+--- a/mstar/model/pi05/config.py
++++ b/mstar/model/pi05/config.py
+@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
+ LLM_KV = "kv"
+ LLM_ATTN = "attn"
+ LLM_POS = "rope"
++# The prefix expert and the action expert read and write one KV cache.
++LLM_NODES = ("LLM", "action_expert")
+ 
+ 
+ @dataclass
+diff --git a/mstar/model/pi05/pi05_model.py b/mstar/model/pi05/pi05_model.py
+index 379d6d9ae..c2a38a1b7 100644
+--- a/mstar/model/pi05/pi05_model.py
++++ b/mstar/model/pi05/pi05_model.py
+@@ -70,11 +70,12 @@ from mstar.model.pi05.components.tokenization import Pi05Tokenizer
+ from mstar.model.pi05.config import (
+     LLM_ATTN,
+     LLM_KV,
++    LLM_NODES,
+     LLM_POS,
+     Pi05Config,
+     load_pi05_config,
+ )
+-from mstar.model.pi05.submodules import Pi05LLMSubmodule, Pi05ViTEncoderSubmodule
++from mstar.model.pi05.submodules import Pi05ActionSubmodule, Pi05LLMSubmodule, Pi05ViTEncoderSubmodule
+ from mstar.model.submodule_base import NodeSubmodule
+ 
+ logger = logging.getLogger(__name__)
+@@ -153,7 +154,6 @@ class Pi05Model(Model):
+     PREPROCESS_PARALLEL_IMAGES = True
+ 
+     PREFILL_WALK = "prefill"
+-    ACTION_GEN_WALK = "action_gen"
+ 
+     def __init__(
+         self,
+@@ -429,13 +429,13 @@ class Pi05Model(Model):
+             num_qo_heads=self.config.num_qo_heads,
+         )
+         return [
+-            KVSpec(resource_key=LLM_KV, nodes={"LLM"}, config=kv_config),
++            KVSpec(resource_key=LLM_KV, nodes=set(LLM_NODES), config=kv_config, leader="LLM"),
+             AttentionSpec(
+-                resource_key=LLM_ATTN, nodes={"LLM"},
++                resource_key=LLM_ATTN, nodes=set(LLM_NODES),
+                 config=AttentionConfig(kv_cache=LLM_KV),
+             ),
+             PositionSpec(
+-                resource_key=LLM_POS, nodes={"LLM"},
++                resource_key=LLM_POS, nodes=set(LLM_NODES),
+                 config=PositionConfig(kv_cache=LLM_KV),
+             ),
+         ]
+@@ -447,7 +447,10 @@ class Pi05Model(Model):
+         # tokenizer. So the model only ever sees a single "text_inputs"
+         # stream — there are no separate state-bin tokens. This matches
+         # lerobot's processor_pi05.Pi05PrepareStateTokenizerProcessorStep.
+-        prefill = Sequential(
++        # One walk, so the action step follows the prefix KV write on the worker
++        # with no round trip through the conductor. ``prefix_done`` only orders
++        # the two: the action step reads the prefix through the shared KV.
++        chunk = Sequential(
+             [
+                 GraphNode(
+                     name="vit_encoder",
+@@ -457,30 +460,24 @@ class Pi05Model(Model):
+                 GraphNode(
+                     name="LLM",
+                     input_names=["img_emb", "text_inputs"],
+-                    outputs=[],
++                    outputs=[GraphEdge(next_node="action_expert", name="prefix_done")],
+                 ),
+-            ]
+-        )
+-
+-        # All num_flow_steps Euler steps run inside one LLM step: the prefix KV
+-        # and the action tokens' positions are the same for every step, so one
+-        # plan serves the whole loop, and a worker step per Euler step would
+-        # cost more host time than the step's GPU work.
+-        action_gen = GraphNode(
+-            name="LLM",
+-            input_names=["noisy_actions"],
+-            outputs=[
+-                GraphEdge(
+-                    next_node=EMIT_TO_CLIENT,
+-                    name="actions",
+-                    output_modality="action",
++                GraphNode(
++                    name="action_expert",
++                    input_names=["prefix_done"],
++                    outputs=[
++                        GraphEdge(
++                            next_node=EMIT_TO_CLIENT,
++                            name="actions",
++                            output_modality="action",
++                        ),
++                    ],
+                 ),
+-            ],
++            ]
+         )
+ 
+         return {
+-            self.PREFILL_WALK: prefill,
+-            self.ACTION_GEN_WALK: action_gen,
++            self.PREFILL_WALK: chunk,
+         }
+ 
+     # ------------------------------------------------------------------
+@@ -615,25 +612,11 @@ class Pi05Model(Model):
+         persist_signals: dict[str, list[TensorPointerInfo]],
+         incoming_connections: list[StreamingConnectionState] | None = None,
+     ) -> ForwardPassArgs:
+-        metadata = partition_metadata
+-        request_done = False
+-        inputs: list[GraphEdge] = []
+-
+-        if metadata.graph_walk == self.PREFILL_WALK:
+-            metadata.is_prefill = False
+-            metadata.graph_walk = self.ACTION_GEN_WALK
+-            # The initial noise is drawn in the LLM submodule's prepare_inputs.
+-            inputs = [GraphEdge(next_node="LLM", name="noisy_actions")]
+-        elif metadata.graph_walk == self.ACTION_GEN_WALK:
+-            request_done = True
+-
+-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
+         return ForwardPassArgs(
+-            full_metadata=metadata,
+-            inputs=inputs,
+-            unpersist_tensors=unpersist_tensors,
+-            step_metadata={"is_prefill": metadata.is_prefill},
+-            request_done=request_done,
++            full_metadata=partition_metadata,
++            inputs=[],
++            unpersist_tensors=[],
++            request_done=True,
+         )
+ 
+     # ------------------------------------------------------------------
+@@ -676,6 +659,17 @@ class Pi05Model(Model):
+             return Pi05LLMSubmodule(
+                 embed_tokens=self.embed_tokens,
+                 paligemma=self.paligemma,
++                action_expert=None,
++                action_in_proj=None,
++                action_out_proj=None,
++                time_mlp=None,
++                config=self.config,
++            )
++        if node_name == "action_expert":
++            self._init_llm_components(device)
++            return Pi05ActionSubmodule(
++                embed_tokens=None,
++                paligemma=None,
+                 action_expert=self.action_expert,
+                 action_in_proj=self.action_in_proj,
+                 action_out_proj=self.action_out_proj,
+diff --git a/mstar/model/pi05/submodules.py b/mstar/model/pi05/submodules.py
+index 1dafdd9a9..68dd1cecc 100644
+--- a/mstar/model/pi05/submodules.py
++++ b/mstar/model/pi05/submodules.py
+@@ -251,6 +251,8 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
+ 
+ 
+ class Pi05LLMSubmodule(ARNodeSubmodule):
++    STAGE = "prefill"
++
+     """Combined PaliGemma prefix expert + action expert.
+ 
+     Dispatches by graph_walk:
+@@ -274,8 +276,6 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         "time_mlp.",  # the adaRMS condition
+     )
+ 
+-    # For the default image size and a simple text prompt, one request is about 400 tokens
+-    PREFILL_TOKEN_BUCKETS = [512, 1024, 1800] # 2048 was giving OOM
+     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
+     ACTION_GEN_CAPTURE_BATCH_SIZES = [1, 2, 4]
+ 
+@@ -351,27 +351,18 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         emb = self.embed_tokens(ids)
+         return emb * self._text_embed_scale
+ 
++    def _prefill_token_buckets(self) -> list[int]:
++        """Whole requests' longest prefixes, so a step that fits runs captured: an
++        eager prefill costs tens of ms of host time, a replay under 1 ms."""
++        cfg = self.config
++        longest = cfg.num_cameras * cfg.tokens_per_image + cfg.max_lang_tokens
++        return sorted({512, *(n * longest for n in (1, 2, 4))})
++
+     def get_accelerator_graph_configs(
+         self, device: torch.device, tp_world_size: int = 1,
+     ) -> list[AcceleratorGraphConfig]:
+         del tp_world_size
+         return [
+-            # Action generation always has latents of the same size, so it is a
+-            # similar paradigm to AR decode and can use the batched cuda graphs.
+-            BatchedAcceleratorGraphConfig(
+-                # max-autotune until the default compile level (mstar serve -O) is measured on this model
+-                compile_mode="max-autotune-no-cudagraphs",
+-                capture_graph_walk="action_gen",
+-                single_request_inputs=ARNodeInputs(
+-                    input_seq_len=self.config.action_horizon,
+-                    tensor_inputs={
+-                        "noisy_actions": torch.zeros(
+-                            self.config.action_horizon, self.config.action_dim, device=device
+-                        ),
+-                    }
+-                ),
+-                capture_batch_sizes=self.ACTION_GEN_CAPTURE_BATCH_SIZES
+-            ),
+             PackedAcceleratorGraphConfig(
+                 # max-autotune until the default compile level (mstar serve -O) is measured on this model
+                 compile_mode="max-autotune-no-cudagraphs",
+@@ -382,7 +373,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+                         n, self.config.hidden_size, device=device, dtype=torch.float32
+                     ),
+                 ),
+-                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
++                capture_token_lengths=self._prefill_token_buckets(),
+                 capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+                 compile=True,
+             ),
+@@ -395,13 +386,9 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         inputs: NameToTensorList,
+         **kwargs
+     ) -> ARNodeInputs:
+-        if graph_walk == "prefill":
+-            return self._prepare_inputs_prefill(
+-                inputs=inputs,
+-            )
+-        if graph_walk == "action_gen":
+-            return self._prepare_inputs_action_gen(fwd_info=fwd_info)
+-        raise ValueError(f"Unknown Pi0.5 LLM graph walk: {graph_walk!r}")
++        if self.STAGE == "prefill":
++            return self._prepare_inputs_prefill(inputs=inputs)
++        return self._prepare_inputs_action_gen(fwd_info=fwd_info)
+ 
+     def _prepare_inputs_prefill(
+         self,
+@@ -449,7 +436,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         stored length nor the position counter advances, so all denoise
+         iterations reuse the same prefix and the same action positions.
+         """
+-        is_prefill = graph_walk == "prefill"
++        is_prefill = self.STAGE == "prefill"
+         segments = [
+             Segment(request_id=rid, label="main", span=inp.input_seq_len)
+             for rid, inp in zip(request_ids, inputs, strict=True)
+@@ -474,11 +461,9 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         inputs: list[ARNodeInputs],
+     ) -> dict[str, torch.Tensor | Any]:
+         del engine_inputs
+-        if graph_walk == "prefill":
++        if self.STAGE == "prefill":
+             return self._preprocess_prefill(inputs=inputs)
+-        if graph_walk == "action_gen":
+-            return self._preprocess_action_gen(inputs=inputs)
+-        raise ValueError(f"Unknown Pi0.5 LLM graph walk: {graph_walk!r}")
++        return self._preprocess_action_gen(inputs=inputs)
+ 
+     def _preprocess_prefill(
+         self,
+@@ -512,11 +497,9 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         **kwargs # coming from preprocess output
+     ) -> NameToTensorList:
+         del engine_inputs
+-        if graph_walk == "prefill":
++        if self.STAGE == "prefill":
+             return self._forward_prefill(**kwargs)
+-        if graph_walk == "action_gen":
+-            return self._forward_action_gen(**kwargs)
+-        raise ValueError(f"Unknown Pi0.5 LLM graph walk: {graph_walk!r}")
++        return self._forward_action_gen(**kwargs)
+ 
+     def forward_batched(
+         self,
+@@ -529,18 +512,15 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         ``preprocess`` already concatenated the per-request tensors; the runner
+         planned attention/RoPE from this walk's ``declare_step``.
+         """
+-        if graph_walk == "prefill":
++        if self.STAGE == "prefill":
+             return self._forward_prefill_batched(
+                 request_ids=engine_inputs.request_ids,
+                 **kwargs,
+             )
+-        if graph_walk == "action_gen":
+-            return self._forward_action_gen_batched(
+-                request_ids=engine_inputs.request_ids,
+-                **kwargs,
+-            )
+-        raise ValueError(f"Batched forward not supported for graph walk: {graph_walk!r}")
+-
++        return self._forward_action_gen_batched(
++            request_ids=engine_inputs.request_ids,
++            **kwargs,
++        )
+ 
+     def _forward_prefill_batched(
+         self,
+@@ -550,8 +530,8 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+     ) -> dict[str, NameToTensorList]:
+         """Batched prefill: single PaliGemma forward over concatenated prefixes."""
+         self.paligemma(query_sequence=prefix_embs, label="main")
+-        # Prefill produces no graph-edge outputs.
+-        return {rid: {} for rid in request_ids}
++        done = prefix_embs.new_zeros(len(request_ids))
++        return {rid: {"prefix_done": [done[i:i + 1]]} for i, rid in enumerate(request_ids)}
+ 
+     def _forward_action_gen_batched(
+         self,
+@@ -574,7 +554,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         **kwargs,
+     ) -> NameToTensorList:
+         self.paligemma(query_sequence=prefix_embs, label="main")
+-        return {}
++        return {"prefix_done": [prefix_embs.new_zeros(1)]}
+ 
+     def _forward_action_gen(
+         self,
+@@ -623,3 +603,33 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+             )
+             actions = euler_step(actions, self.action_out_proj(suffix_out), dt)
+         return actions
++
++
++class Pi05ActionSubmodule(Pi05LLMSubmodule):
++    """The action expert's node: reads the prefix KV the LLM node committed and
++    runs the whole Euler loop in one step."""
++
++    STAGE = "action_gen"
++
++    def get_accelerator_graph_configs(
++        self, device: torch.device, tp_world_size: int = 1,
++    ) -> list[AcceleratorGraphConfig]:
++        del tp_world_size
++        return [
++            # Action generation always has latents of the same size, so it is a
++            # similar paradigm to AR decode and can use the batched cuda graphs.
++            BatchedAcceleratorGraphConfig(
++                # max-autotune until the default compile level (mstar serve -O) is measured on this model
++                compile_mode="max-autotune-no-cudagraphs",
++                capture_graph_walk="prefill",
++                single_request_inputs=ARNodeInputs(
++                    input_seq_len=self.config.action_horizon,
++                    tensor_inputs={
++                        "noisy_actions": torch.zeros(
++                            self.config.action_horizon, self.config.action_dim, device=device
++                        ),
++                    }
++                ),
++                capture_batch_sizes=self.ACTION_GEN_CAPTURE_BATCH_SIZES
++            ),
++        ]
