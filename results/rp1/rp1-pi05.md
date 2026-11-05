@@ -8,8 +8,23 @@ Base: run-base e8826a777. GPU: 1x H200. Headline: action-chunk latency p50 at c=
 - **Reworked:** H0b (cc2349495, 46cc72666): only the antialiased resize remains, since main already builds openpi's prompt and bins state as openpi (482dfc764, 41a1bb31d).
 - **Dropped:** 65219f863, a1a514507, 80cfab490 (cameras and prefix scaling: main's 41a1bb31d / #800 does it); 879f3d40b (prompt and binning test, same reason).
 - **Gate:** parity tests in venv-main 68 passed (main_parity_gpu.log). Targeted test/modular, port vs 9c6f1ad: same 40 failed, 3 errors on both; 2853 vs 2838 passed (main_tests*.log). 16-input openpi comparison on main_gate_base15.yaml (pi05_base, 3 cameras, horizon 15, what the reference ran): PASS, sequential max 0.0196, c=8 max 0.0235.
-- **Gate limit:** main's own pi05_droid.yaml serves lerobot/pi05_droid with 2 cameras and norm stats; the openpi reference uses pi05_base, so it cannot gate that config. There the port differs from 9c6f1ad by max 0.413, mean 0.0103. Whether that is the intended correction is not established; unported main on the reference-comparable config is queued to compare.
-- **Checkpoint on main:** not yet run.
+- **Gate limit:** main's own pi05_droid.yaml serves lerobot/pi05_droid with 2 cameras and norm stats; the openpi reference uses pi05_base, so it cannot gate that config. There the port differs from 9c6f1ad by max 0.413, mean 0.0103. On the reference-comparable config unported 9c6f1ad FAILS (max 1.400, mean 0.149) and the port passes, so the port corrects real error on main; that the DROID difference is the same correction is likely but not verified, and which commit fixes what on main was not isolated.
+- **Checkpoint on main, batch h200_1104, status counted, 36 rows (01:50-03:10 UTC approx):** `main_pair_round.sh mck_droid|mck_base <9c6f1ad75> <8adf90628> <config> 3`, FE_FLAG=--rust-frontend (it serves pi0.5: 0 failures, actions within noise of the default frontend, logs/main_fe), MSTAR_SHM_ARENA=1, step_thread_core: siblings on both arms. c=1 from paired_c1.py, c=4/8 from benchmark.runner.
+  pi05_droid.yaml:
+  c=1 main: p50 [75.1, 75.42, 88.25] p99 [88.03, 84.56, 99.74] thr [13.249, 13.262, 11.283]
+  c=1 port: p50 [34.09, 34.16, 35.1] p99 [38.57, 39.09, 39.37] thr [29.116, 29.076, 28.404]
+  c=4 main: p50 [95.52, 90.42, 140.35] p99 [123.01, 122.49, 171.79] thr [41.649, 42.418, 28.236]
+  c=4 port: p50 [75.33, 74.98, 75.81] p99 [81.78, 79.39, 81.63] thr [53.972, 54.321, 52.399]
+  c=8 main: p50 [129.47, 129.26, 205.07] p99 [205.16, 195.37, 316.85] thr [59.911, 59.251, 37.674]
+  c=8 port: p50 [87.13, 84.93, 93.47] p99 [120.89, 105.74, 102.17] thr [88.267, 90.631, 84.281]
+  pi05.yaml:
+  c=1 main: p50 [90.44, 88.93, 75.15] p99 [110.64, 100.03, 87.59] thr [10.97, 11.158, 13.08]
+  c=1 port: p50 [36.16, 35.89, 35.66] p99 [45.01, 41.91, 40.64] thr [27.262, 27.534, 27.845]
+  c=4 main: p50 [143.17, 144.59, 100.45] p99 [165.59, 181.13, 127.19] thr [27.484, 27.065, 39.891]
+  c=4 port: p50 [80.83, 79.95, 81.97] p99 [95.26, 87.94, 85.83] thr [48.535, 49.49, 49.167]
+  c=8 main: p50 [218.01, 208.22, 140.2] p99 [421.23, 320.43, 218.87] thr [34.404, 37.095, 55.258]
+  c=8 port: p50 [94.65, 95.09, 95.06] p99 [126.84, 121.94, 115.54] thr [81.948, 80.24, 79.612]
+- **Caveats:** a harness bug (`local k=$1 out=$L/r$k`) wrote every round to one r/ directory, now fixed, so rows come from the RESULT lines (report_main_out.py) and per-round server logs and gate files exist only for each config's last round; the capture check covers only those (both clean). So a dropped capture in rounds 1-2 cannot be ruled out from logs. pi05_droid main's round 3 (c=1 88.25, c=8 205) is slow with captures clean and unexplained. Baseline's outputs are the ones that fail the reference on the comparable config, so this is speed against main, not like for like on correctness.
 
 ## Corrections (read first; 2026-11-04 03:10 UTC)
 
@@ -429,4 +444,5 @@ API path at 6eba3b986, c=1, trace_clean2 (173 requests, E2E p50 37 ms): first fo
 - As measured: c=1 overlaps (candidate's round 1 39.83, the others 36.90 and 36.06, against base 37.92-38.78). c=4 p50 better but p99 133-146 vs 85-88. c=8 throughput regresses with non-overlapping rounds. gate PASS, all captures ok. Concurrent gate for H27 not run (pod restart); run it if H27 is revived.
 - decision: not applied. Worktree wt-rp1-pi05-h27 and h27.patch kept as the base for H28.
 - Deviation: perf/rp1-results is refreshed with new commits rather than amending one, so the branch only moves forward and every push lands (the brief says refresh that commit, and never to force-move a branch). It also holds the harness scripts, patches and reference actions, since /workspace may not come back.
+- Main port gate on unported main, base15 config: FAIL max 1.400 (logs/main_gate/base15_base). Main checkpoint reported; see On main.
 

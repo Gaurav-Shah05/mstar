@@ -15,7 +15,7 @@ yaml.safe_dump(c, open(sys.argv[2], "w"), sort_keys=False)
 PY
 }
 one_round() {
-  local k=$1 out=$L/r$k; mkdir -p "$out/A" "$out/B"
+  local k=$1; local out=$L/r$k; mkdir -p "$out/A" "$out/B"
   git -C "$CKA" rev-parse --short HEAD > "$out/A/commit.txt"; git -C "$CKB" rev-parse --short HEAD > "$out/B/commit.txt"
   uptime > "$out/load.txt"
   cfg "$CKA" "$out/A/$CFG"; cfg "$CKB" "$out/B/$CFG"
