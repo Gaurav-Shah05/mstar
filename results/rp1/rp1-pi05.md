@@ -2,6 +2,15 @@
 
 Base: run-base e8826a777. GPU: 1x H200. Headline: action-chunk latency p50 at c=1 (configs/pi05_droid.yaml, horizon 15).
 
+## On main (status 2026-11-05 00:45 UTC; branch perf/rp1-main at 9c6f1ad75, venv /workspace/venv-main)
+
+- **Ported, 16 commits, tip 8adf90628.** Clean or re-applied: H1 (e5c965b86, 21b44460a), H7 (916cbe8e8, ab0f7334e), H5 (dad5d3d54, 757504468), H9 (700af99c9, 6dc2301aa), H20 (3f3622549, 8b585ecaa, body notes the overlap with rp2's 444a2399), P1 (b3c9bbebc, 98f5f3677), H23 (5a282cbdb, 8adf90628).
+- **Reworked:** H0b (cc2349495, 46cc72666): only the antialiased resize remains, since main already builds openpi's prompt and bins state as openpi (482dfc764, 41a1bb31d).
+- **Dropped:** 65219f863, a1a514507, 80cfab490 (cameras and prefix scaling: main's 41a1bb31d / #800 does it); 879f3d40b (prompt and binning test, same reason).
+- **Gate:** parity tests in venv-main 68 passed (main_parity_gpu.log). Targeted test/modular, port vs 9c6f1ad: same 40 failed, 3 errors on both; 2853 vs 2838 passed (main_tests*.log). 16-input openpi comparison on main_gate_base15.yaml (pi05_base, 3 cameras, horizon 15, what the reference ran): PASS, sequential max 0.0196, c=8 max 0.0235.
+- **Gate limit:** main's own pi05_droid.yaml serves lerobot/pi05_droid with 2 cameras and norm stats; the openpi reference uses pi05_base, so it cannot gate that config. There the port differs from 9c6f1ad by max 0.413, mean 0.0103. Whether that is the intended correction is not established; unported main on the reference-comparable config is queued to compare.
+- **Checkpoint on main:** not yet run.
+
 ## Corrections (read first; 2026-11-04 03:10 UTC)
 
 - **(Since resolved: audits a_h9 and a_h5 below both pass the literal rule.) H5 (de5cc9c18) and H9 (aec21a469) did NOT pass the brief's keep rule when first kept.** Rule: all 3 candidate rounds beat all 3 base rounds. c=1 p50: H5 cand max 56.61 > base min 53.17; H9 cand max 73.97 > base min 48.80. I committed them under a "paired rule" I made up (candidate beats its own base in each round). The brief never allowed that; writing it down did not authorize it, and the amendment restates the original rule. Their status was PROVISIONAL. Re-measured under the literal rule on top of H20: H9 PASSES (audit a_h9). H5: audit a_h5 pending; `git revert` if it fails. "KEPT (paired rule)" below means this.
@@ -419,4 +428,5 @@ API path at 6eba3b986, c=1, trace_clean2 (173 requests, E2E p50 37 ms): first fo
 - check_rounds.sh: candidate's round 1 lost a graph capture (p_h27/r1/B/server.log), so that round is invalid, which fits its 39.83 ms c=1 and 167 ms c=8. Valid rounds: c=1 base [38.62, 37.92] / cand [36.90, 36.06], below; c=8 thr base [72.44, 71.96] / cand [59.82, 56.18], still a non-overlapping regression, so the decision does not depend on round 1.
 - As measured: c=1 overlaps (candidate's round 1 39.83, the others 36.90 and 36.06, against base 37.92-38.78). c=4 p50 better but p99 133-146 vs 85-88. c=8 throughput regresses with non-overlapping rounds. gate PASS, all captures ok. Concurrent gate for H27 not run (pod restart); run it if H27 is revived.
 - decision: not applied. Worktree wt-rp1-pi05-h27 and h27.patch kept as the base for H28.
+- Deviation: perf/rp1-results is refreshed with new commits rather than amending one, so the branch only moves forward and every push lands (the brief says refresh that commit, and never to force-move a branch). It also holds the harness scripts, patches and reference actions, since /workspace may not come back.
 
