@@ -103,9 +103,9 @@ class BatchBuildRequest:
     min_chunk_tokens: int = 1
     # Rows already mid-prefill -> when their first chunk was cut; lower is older.
     start_order: dict[int, int] = field(default_factory=dict)
-    # Cut a step just past a capture bucket back to it; None where the walk doesn't.
+    # Cut a step of chunkable rows alone, just past a capture bucket, back to it; None where the walk doesn't.
     bucket_cut: "BucketCut | None" = None
-    # Tokens the step carries beside these rows: a speculation chain's.
+    # Tokens the step carries beside these rows: a speculation chain's. Any stops the cut.
     chain_tokens: int = 0
 
 
@@ -486,13 +486,17 @@ def fill_token_budget(
 def cut_to_bucket(
     take: dict[int, int], chunkable: set[int], cut: "BucketCut", min_chunk: int = 1, chain_tokens: int = 0,
 ) -> None:
-    """Cut one chunkable row of ``take`` so the step lands on the capture
-    bucket below it, when the padding that avoids, net of the bucket the rest
-    then pads to, is at least ``cut.min_saved`` tokens. The longest row gives
-    up the tokens: it is the one left with the most to run anyway, whichever
-    prompt started first, and it may be the row the budget already cut. The
-    counts are the walk's at any batch size, so a miss only costs padding."""
-    total = chain_tokens + sum(take.values())
+    """Cut one row of ``take`` so the step lands on the capture bucket below
+    it, when the padding that avoids, net of the bucket the rest then pads to,
+    is at least ``cut.min_saved`` tokens. Only a step of chunkable rows cuts: beside
+    decode rows the prompt's extra step costs more TTFT than the padding saves.
+    The longest row gives up the tokens: it is the one left with the most to
+    run anyway, whichever prompt started first, and it may be the row the budget
+    already cut. The counts are the walk's at any batch size, so a miss only
+    costs padding."""
+    if chain_tokens or not chunkable.issuperset(take):
+        return
+    total = sum(take.values())
     above = bisect_left(cut.counts, total)
     if above == 0 or above == len(cut.counts) or cut.counts[above] == total:
         return
@@ -501,7 +505,7 @@ def cut_to_bucket(
     rest = bisect_left(cut.counts, excess)
     if cut.counts[above] - lower - cut.counts[rest] < cut.min_saved:
         return
-    rows = [rid for rid in take if rid in chunkable and take[rid] - excess >= min_chunk]
+    rows = [rid for rid in take if take[rid] - excess >= min_chunk]
     if rows:
         take[max(rows, key=take.__getitem__)] -= excess
 

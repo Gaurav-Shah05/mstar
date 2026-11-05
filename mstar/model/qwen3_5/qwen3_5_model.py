@@ -323,7 +323,8 @@ class Qwen3_5DenseModel(Model):
             ChunkingPolicy(
                 walks=("prefill_text",), chunkable=True, max_batch_tokens=budget, bucket_cut_min_saved=saved,
             ),
-            # carries the budget for the steps that mix a chunk with decode rows
+            # carries the budget for the steps that mix a chunk with decode rows; the scheduler
+            # reads every step's cut from this combined key, though only a step of prompts cuts
             ChunkingPolicy(walks=(LLM_MIXED,), max_batch_tokens=budget, bucket_cut_min_saved=saved),
         )}
 

@@ -547,6 +547,7 @@ class ChunkingPolicy:
     # next one up. The fewest padded tokens that make it worth cutting a prompt
     # at the lower bucket and running the rest in a step of its own, against
     # the cost of that step, which is the model's (None never cuts for this).
+    # Only a step of chunkable rows alone cuts.
     bucket_cut_min_saved: int | None = None
 
     def __post_init__(self):

@@ -482,16 +482,19 @@ and 2176 for a mixed step, since the LLM's 2048-token step budget
 reached. Each bucket adds captures and startup time.
 
 ``model_kwargs: bucket_cut_min_saved: N`` (off by default, 512 in
-``configs/qwen3_5_9b.yaml``) cuts a step just past a bucket back to it when
-that avoids at least ``N`` padded tokens, net of the bucket the rest pads to. A
-lone 1034-token prompt then replays 1024 and a small bucket instead of 2048.
-On 9B (H200, ``--rust-frontend``, three fresh servers an arm, random 1024/256)
-TTFT p50 goes from 73.7 to 62.6 ms at c=1 and 76.1 to 72.5 at c=4, and output
-tok/s rises 2.6% at c=16, where TTFT p50 goes from 163.8 to 167.4 ms; ShareGPT
-is flat. A prompt cut this way keeps its prefix-cache GDN snapshot at an earlier
-page boundary, so a resend re-runs more tokens the first time. It stays off on
-0.8B, where one pair measured 0.98x tok/s at c=32 and 0.97x at c=64 with TTFT
-p50 rising 24-32%, and a second step appears to cost more than the padding.
+``configs/qwen3_5_9b.yaml``) cuts a step of chunkable prompts alone, just past a bucket, back
+to it when that avoids at least ``N`` padded tokens, net of the bucket the rest
+pads to. A lone 1034-token prompt then replays 1024 and a small bucket instead of
+2048. A step with decode rows stays whole: there the prompt's extra step cost more
+TTFT than the padding saved (cutting those steps too took 9B's Random c=64 TTFT p50
+from 312 to 386 ms).
+On 9B (H200, ``--rust-frontend``, three fresh servers an arm, random 1024/256, no
+prompt shared between cells) TTFT p50 goes from 72.4 to 59.8 ms at c=1 and 139.5 to
+116.3 at c=4, and output tok/s rises 1.0% and 2.2%; c=16 and up are flat within
+their spread, as is ShareGPT at c=1 and c=16. A prompt cut this way keeps its
+prefix-cache GDN snapshot at an earlier page boundary, which is expected to make a
+resend re-run more tokens the first time (not measured). It stays off on 0.8B,
+where one pair of the earlier form read 0.98x tok/s at c=32 and 0.97x at c=64.
 
 A captured decode step builds its rotary tables inside the graph from the
 planned positions, rather than staging tables built eagerly before the replay
