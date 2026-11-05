@@ -473,3 +473,7 @@ API path at 6eba3b986, c=1, trace_clean2 (173 requests, E2E p50 37 ms): first fo
 - gate PASS all rounds; concurrent gate PASS at c=1, 4, 8, 16 (max 0.0235); all captures ok.
 - decision: not kept, under the literal rule. No re-run: another run of the same change would only be fishing for a pass.
 
+### Protocol question found by logs/trace_h28 (H28 alone: E2E p50 33 ms; best's solo trace trace_clean3: 37 ms; paired rounds showed about 1.2 ms)
+- pair_round.sh keeps two servers up and alternates single requests; hypothesis, unverified: GPU process switches and waking an idle server cost each request, which production does not pay and which hides part of a gain. The brief's round is sequential (alternating order, 3 rounds each, fresh server per round); pair_round.sh was my own addition against noise H20 has since removed.
+- Terms set before measuring: H28 re-measured under the brief's own protocol, literal keep rule unchanged, p_h28's FAIL stays on record and both are reported. `round_cached.sh s_h28 <3444a8779> <H28> pi05_droid.yaml "B C C B B C"`; each arm one fresh server with a kept per-arm Inductor cache (time before the 05:45Z cutoff rules out recompiling), benchmark.runner at c=1,4,8, 200 requests each.
+
