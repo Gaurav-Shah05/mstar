@@ -450,4 +450,5 @@ API path at 6eba3b986, c=1, trace_clean2 (173 requests, E2E p50 37 ms): first fo
 - Hypothesis that rows batch less under one walk: REFUTED. c=8 prefill batch sizes: H27 3-4 rows (55 of 60 steps); best 2-3 rows (64 of 84 logical).
 - c=4: all 39 of H27's 2-row prefills ran eager at 47.6 ms host, against 0.9 ms captured: two ~930-token prefixes exceed the 1800 bucket. c=8: every H27 3-4 row prefill eager, 24-27 ms host; best's eager steps 14-35 ms.
 - H28: H27 plus prefill buckets from the longest prefix. a: [512, 968, 1936]; b: adds 3872. Both probed with bs_probe.sh.
+- H28 probes (logs/h28.out): a [512,968,1936] c=4 p50 70.39 p99 86.45 thr 56.80, c=8 p50 91.89 p99 263.47 thr 67.65, 3-4 row prefills still eager (22.9, 36.8 ms). b [512,968,1936,3872] c=4 p50 70.41 p99 86.79 thr 56.67, c=8 p50 99.74 p99 146.18 thr 71.30, every prefill captured. best, same harness: c=4 p50 80.91 p99 127.20 thr 48.55, c=8 p50 107.93 p99 146.39 thr 72.11. Taking b to paired rounds (p_h28), then concurrent gate. Queue is timed to end before 05:45Z.
 
