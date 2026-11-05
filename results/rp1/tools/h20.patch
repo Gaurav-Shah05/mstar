@@ -1,0 +1,135 @@
+diff --git a/mstar/api_server/entrypoint.py b/mstar/api_server/entrypoint.py
+index 0fec0a3c9..63eaa69e0 100644
+--- a/mstar/api_server/entrypoint.py
++++ b/mstar/api_server/entrypoint.py
+@@ -2776,6 +2776,8 @@ def _set_preprocess_threads(model, config: dict) -> None:
+ 
+ 
+ def main(argv: list[str] | None = None):
++    # first, so every thread and process of the deployment inherits it
++    cpus.run_at_full_frequency()
+     import argparse
+ 
+     import yaml
+diff --git a/mstar/utils/cpus.py b/mstar/utils/cpus.py
+index f110dcfbd..721203ab4 100644
+--- a/mstar/utils/cpus.py
++++ b/mstar/utils/cpus.py
+@@ -23,9 +23,13 @@ the first holds a lock on it (``claim_gpus``) and the next pins nothing.
+ """
+ from __future__ import annotations
+ 
++import ctypes
+ import fcntl
++import logging
+ import math
+ import os
++import platform
++import struct
+ from collections.abc import Callable, Collection, Iterable, Sequence
+ from dataclasses import dataclass
+ from pathlib import Path
+@@ -39,6 +43,42 @@ _GPU_LOCK_DIR = Path("/tmp")
+ 
+ PINNABLE = hasattr(os, "sched_setaffinity")
+ 
++logger = logging.getLogger(__name__)
++
++# sched_setattr(2): the syscall has no libc wrapper
++_SCHED_SETATTR = {"x86_64": 314, "aarch64": 380}
++_SCHED_FLAG_KEEP_POLICY_PARAMS = 0x18
++_SCHED_FLAG_UTIL_CLAMP_MIN = 0x20
++_SCHED_CAPACITY_SCALE = 1024
++
++
++def run_at_full_frequency() -> bool:
++    """Ask the kernel to run this thread, and every thread and process started
++    from it, at full CPU frequency while runnable (``uclamp.min``).
++
++    A serving step hands off between threads and processes that sleep in
++    between. Under the ``schedutil`` governor a thread woken after about 10 ms
++    asleep runs up to 4x slower until the frequency ramps back up, so that
++    host time grows with every hand-off. This changes only the frequency a
++    runnable thread asks for; idle threads stay asleep. Returns whether the
++    kernel took it: a kernel without ``CONFIG_UCLAMP_TASK`` or a sandbox
++    refusing the call leaves the governor's default, which is logged.
++    """
++    number = _SCHED_SETATTR.get(platform.machine())
++    if number is None:
++        logger.warning("Not requesting full CPU frequency: no sched_setattr number for %s", platform.machine())
++        return False
++    # struct sched_attr: size, policy, flags, nice, priority, runtime, deadline, period, util_min, util_max
++    attr = struct.pack(
++        "IIQiIQQQII", 56, 0, _SCHED_FLAG_KEEP_POLICY_PARAMS | _SCHED_FLAG_UTIL_CLAMP_MIN,
++        0, 0, 0, 0, 0, _SCHED_CAPACITY_SCALE, 0,
++    )
++    libc = ctypes.CDLL(None, use_errno=True)
++    if libc.syscall(number, 0, ctypes.c_char_p(attr), 0) != 0:
++        logger.warning("Not requesting full CPU frequency: sched_setattr: %s", os.strerror(ctypes.get_errno()))
++        return False
++    return True
++
+ 
+ # ── CPU lists ───────────────────────────────────────────────────────────────
+ 
+diff --git a/test/modular/test_cpu_frequency.py b/test/modular/test_cpu_frequency.py
+new file mode 100644
+index 000000000..c391f39b3
+--- /dev/null
++++ b/test/modular/test_cpu_frequency.py
+@@ -0,0 +1,55 @@
++"""``cpus.run_at_full_frequency``: the uclamp hint is set on the calling thread
++and inherited by processes it starts, without touching the scheduling policy."""
++import ctypes
++import multiprocessing
++import os
++import platform
++import struct
++
++import pytest
++
++from mstar.utils import cpus
++
++_SCHED_GETATTR = {"x86_64": 315, "aarch64": 381}
++
++
++def _util_min_and_policy() -> tuple[int, int]:
++    buf = ctypes.create_string_buffer(56)
++    libc = ctypes.CDLL(None, use_errno=True)
++    assert libc.syscall(_SCHED_GETATTR[platform.machine()], 0, buf, 56, 0) == 0, os.strerror(ctypes.get_errno())
++    fields = struct.unpack("IIQiIQQQII", buf.raw)
++    return fields[8], fields[1]
++
++
++def _report(queue) -> None:
++    queue.put(_util_min_and_policy())
++
++
++def _in_fresh_process(target, *args):
++    ctx = multiprocessing.get_context("spawn")
++    process = ctx.Process(target=target, args=args)
++    process.start()
++    process.join(60)
++    assert process.exitcode == 0
++
++
++def _set_then_spawn(queue) -> None:
++    if not cpus.run_at_full_frequency():
++        queue.put(None)
++        return
++    queue.put(_util_min_and_policy())
++    # a spawned grandchild: exec keeps the attribute, as a deployment's workers need
++    _in_fresh_process(_report, queue)
++
++
++def test_full_frequency_reaches_spawned_processes_and_keeps_the_policy():
++    if platform.machine() not in _SCHED_GETATTR:
++        pytest.skip("no sched_setattr number here")
++    queue = multiprocessing.get_context("spawn").Queue()
++    # in a child, so the pytest process's own threads keep the default
++    _in_fresh_process(_set_then_spawn, queue)
++    first = queue.get(timeout=5)
++    if first is None:
++        pytest.skip("this kernel or sandbox refuses uclamp")
++    assert first == (1024, os.SCHED_OTHER)
++    assert queue.get(timeout=5) == (1024, os.SCHED_OTHER)

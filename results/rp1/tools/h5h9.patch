@@ -1,0 +1,315 @@
+diff --git a/mstar/model/pi05/components/action_expert.py b/mstar/model/pi05/components/action_expert.py
+index 945c52157..4f325831a 100644
+--- a/mstar/model/pi05/components/action_expert.py
++++ b/mstar/model/pi05/components/action_expert.py
+@@ -6,8 +6,9 @@ dimensions with the PaliGemma expert (same num_kv_heads and head_dim)
+ so it can attend to the prefix KV cache that PaliGemma wrote during
+ the prefill walk.
+ 
+-Composed from ``mstar.model.components`` — ``AdaRMSNorm`` for the
+-conditional norms, ``GatedDecoderLayer`` for the gated-residual block,
++Composed from ``mstar.model.components`` — ``AdaRMSNorm`` (fed a
++precomputed modulation, see ``Pi05AdaRMSNorm``) for the conditional norms,
++``GatedDecoderLayer`` for the gated-residual block,
+ and the parallel-aware ``ParallelAttention`` / ``ParallelGatedMLP`` for
+ the inner blocks (with a trivial single-rank comm group for the non-TP
+ case). The model-specific pieces left here are ``Pi05TimeMLP`` (the
+@@ -21,11 +22,13 @@ from torch import nn
+ from mstar.model.components import AdaRMSNorm, GatedDecoderLayer
+ from mstar.model.components.distributed import ParallelAttention, ParallelGatedMLP
+ from mstar.model.pi05.config import LLM_ATTN, LLM_KV, LLM_POS, Pi05Config
++from mstar.utils.adarms_norm import adarms_norm_fused
+ 
+ 
+ class Pi05TimeMLP(nn.Module):
+     """Two-layer SiLU MLP that maps the sincos timestep embedding to the
+-    ``adarms_cond`` vector consumed by every norm in the action expert.
++    adaRMS condition, from which every norm in the action expert computes its
++    modulation.
+ 
+     Both layers operate in the action expert's hidden dimension (which
+     may differ from PaliGemma's). Mirrors lerobot's ``time_mlp_in`` /
+@@ -46,6 +49,30 @@ class Pi05TimeMLP(nn.Module):
+         return nn.functional.silu(h)
+ 
+ 
++class Pi05AdaRMSNorm(AdaRMSNorm):
++    """``AdaRMSNorm`` fed its precomputed modulation rather than the condition.
++
++    The condition depends only on the denoising step, so every norm's
++    ``dense(cond)`` is computed for all steps at once
++    (:meth:`Pi05ActionExpert.modulations`). A layer passes both of its norms
++    the same ``[2, 3 * hidden]`` block; ``slot`` picks this norm's row, which
++    every request in the batch shares.
++    """
++
++    def __init__(self, hidden_size: int, cond_dim: int, eps: float, slot: int):
++        super().__init__(hidden_size, cond_dim=cond_dim, eps=eps)
++        self.slot = slot
++
++    def forward(
++        self, x: torch.Tensor, modulations: torch.Tensor,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        mod = modulations[self.slot:self.slot + 1]
++        H = self.hidden_size
++        return adarms_norm_fused(
++            x, mod[:, :H], mod[:, H:2 * H], mod[:, 2 * H:], self.variance_epsilon,
++        )
++
++
+ def Pi05ActionExpertLayer(config: Pi05Config) -> GatedDecoderLayer:
+     """One action expert decoder layer.
+ 
+@@ -71,8 +98,8 @@ def Pi05ActionExpertLayer(config: Pi05Config) -> GatedDecoderLayer:
+             intermediate_size=config.action_intermediate_size,
+             activation="gelu_tanh",
+         ),
+-        input_layernorm=AdaRMSNorm(h, cond_dim=h, eps=config.rms_norm_eps),
+-        post_attention_layernorm=AdaRMSNorm(h, cond_dim=h, eps=config.rms_norm_eps),
++        input_layernorm=Pi05AdaRMSNorm(h, cond_dim=h, eps=config.rms_norm_eps, slot=0),
++        post_attention_layernorm=Pi05AdaRMSNorm(h, cond_dim=h, eps=config.rms_norm_eps, slot=1),
+     )
+ 
+ 
+@@ -89,23 +116,43 @@ class Pi05ActionExpert(nn.Module):
+         self.layers = nn.ModuleList(
+             [Pi05ActionExpertLayer(config) for _ in range(config.num_layers)]
+         )
+-        self.norm = AdaRMSNorm(h, cond_dim=h, eps=config.rms_norm_eps)
++        self.norm = Pi05AdaRMSNorm(h, cond_dim=h, eps=config.rms_norm_eps, slot=0)
++
++    def modulations(self, conds: torch.Tensor) -> tuple[list[torch.Tensor], torch.Tensor]:
++        """Every norm's modulation for each condition row.
++
++        Args:
++            conds: ``[num_steps, hidden]``, one condition per denoising step.
++
++        Returns:
++            ``(per_layer, final)``: per layer ``[num_steps, 2, 3 * hidden]``
++            (input and post-attention norm), and ``[num_steps, 1, 3 * hidden]``
++            for the final norm.
++        """
++        per_layer = [
++            torch.stack(
++                [layer.input_layernorm.dense(conds), layer.post_attention_layernorm.dense(conds)], dim=1,
++            )
++            for layer in self.layers
++        ]
++        return per_layer, self.norm.dense(conds).unsqueeze(1)
+ 
+     def forward(
+         self,
+         query_sequence: torch.Tensor,
+-        adarms_cond: torch.Tensor,
++        layer_modulations: list[torch.Tensor],
++        final_modulation: torch.Tensor,
+         *,
+         label: str,
+     ) -> torch.Tensor:
++        """One step: ``layer_modulations[i]`` is layer ``i``'s ``[2, 3 * hidden]``
++        block and ``final_modulation`` the final norm's ``[1, 3 * hidden]``."""
+         # The label and layer index are cursors on the shared resources: bind
+         # the label once, advance the index per layer. Passing them as
+         # arguments instead would make inductor specialize on the int.
+         self.layers[0].self_attn.attend.bind_step(label)
+-        for layer_idx, layer in enumerate(self.layers):
++        for layer_idx, (layer, modulation) in enumerate(zip(self.layers, layer_modulations, strict=True)):
+             layer.self_attn.attend.set_layer_idx(layer_idx)
+-            query_sequence = layer(
+-                hidden_states=query_sequence, adarms_cond=adarms_cond,
+-            )
+-        out, _ = self.norm(query_sequence, adarms_cond)
++            query_sequence = layer(hidden_states=query_sequence, adarms_cond=modulation)
++        out, _ = self.norm(query_sequence, final_modulation)
+         return out
+diff --git a/mstar/model/pi05/pi05_model.py b/mstar/model/pi05/pi05_model.py
+index 967dd765b..b4223dc51 100644
+--- a/mstar/model/pi05/pi05_model.py
++++ b/mstar/model/pi05/pi05_model.py
+@@ -426,9 +426,13 @@ class Pi05Model(Model):
+         )
+         return [
+             KVSpec(resource_key=LLM_KV, nodes={"LLM"}, config=kv_config),
++            # FlashInfer's FA2 kernels: an action_gen step's few action
++            # queries over the whole prefix ran 3.9 ms (of 14) faster per
++            # chunk than on the FA3 kernel AUTO picks on an H200, for 0.3 ms
++            # more prefill.
+             AttentionSpec(
+                 resource_key=LLM_ATTN, nodes={"LLM"},
+-                config=AttentionConfig(kv_cache=LLM_KV),
++                config=AttentionConfig(kv_cache=LLM_KV, flashinfer_backend="fa2"),
+             ),
+             PositionSpec(
+                 resource_key=LLM_POS, nodes={"LLM"},
+@@ -644,7 +648,7 @@ class Pi05Model(Model):
+         # deliberately NOT applied at param allocation. Pi0.5's submodules
+         # (Pi05ViTEncoderSubmodule / Pi05LLMSubmodule) override ``to()`` to
+         # keep precision-sensitive params in fp32 — SigLIP's patch and
+-        # position embeddings and the transformer norms — as
++        # position embeddings, the transformer norms and the time MLP — as
+         # openpi's ``to_bfloat16_for_selected_params`` does. Meta-casting to bf16 before
+         # ``to_empty`` would load those weights into bf16 storage and lose
+         # precision that the post-load fp32 upcast cannot recover (~0.2 abs
+diff --git a/mstar/model/pi05/submodules.py b/mstar/model/pi05/submodules.py
+index 8fe310ade..ea70176f4 100644
+--- a/mstar/model/pi05/submodules.py
++++ b/mstar/model/pi05/submodules.py
+@@ -272,6 +272,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         "input_layernorm",
+         "post_attention_layernorm",
+         ".norm.",   # final RMSNorm / adaRMS norm
++        "time_mlp.",  # the adaRMS condition, fp32 in openpi too
+     )
+ 
+     # For the default image size and a simple text prompt, one request is about 400 tokens
+@@ -303,11 +304,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         # input normalizer, and ``embed_tokens`` here is a plain nn.Embedding.
+         self._text_embed_scale = math.sqrt(config.hidden_size)
+ 
+-        # Lazily allocated on the first action_gen step, sized for the largest
+-        # captured batch. sincos_timestep_embedding fully overwrites this buffer
+-        # every step, so torch.empty suffices (no zeroing needed).
+         self._fraction: torch.Tensor | None = None
+-        self._time_emb_buffer: torch.Tensor | None = None
+ 
+     def to(self, *args, **kwargs):
+         """Apply standard ``to()`` then upcast norm parameters back to fp32.
+@@ -355,22 +352,6 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         )
+         return self._fraction
+ 
+-    def _get_time_emb_buffer(self, bs: int) -> torch.Tensor:
+-        """Return a pre-allocated slice of shape (bs, action_hidden_size).
+-
+-        Allocated once at the largest capture batch size (float32, matching
+-        noisy_actions dtype). sincos_timestep_embedding fully overwrites it
+-        every step, so no zeroing is needed — torch.empty suffices.
+-        """
+-        max_bs = max(self.ACTION_GEN_CAPTURE_BATCH_SIZES)
+-        if self._time_emb_buffer is None:
+-            self._time_emb_buffer = torch.empty(
+-                max_bs, self.config.action_hidden_size,
+-                device=self.get_device(),
+-                dtype=torch.float32,
+-            )
+-        return self._time_emb_buffer[:bs]
+-
+     def _embed_tokens_scaled(self, ids: torch.Tensor) -> torch.Tensor:
+         emb = self.embed_tokens(ids)
+         return emb * self._text_embed_scale
+@@ -524,7 +505,6 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         return {
+             "noisy_actions": cat_noisy,
+             "fraction": self._get_timestep_emb_fraction(),
+-            "time_emb_buffer": self._get_time_emb_buffer(len(inputs))
+         }
+ 
+     # ------------------------------------------------------------------
+@@ -583,12 +563,11 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         request_ids: list[str],
+         noisy_actions: torch.Tensor,
+         fraction: torch.Tensor,
+-        time_emb_buffer: torch.Tensor,
+         **kwargs
+     ) -> dict[str, NameToTensorList]:
+         """Batched action_gen: the denoising loop over the concatenated rows, then split per-request."""
+         horizon = self.config.action_horizon
+-        actions = self._denoise(noisy_actions, fraction=fraction, time_emb_buffer=time_emb_buffer)
++        actions = self._denoise(noisy_actions, fraction=fraction)
+         return {
+             rid: {"actions": [actions[i * horizon:(i + 1) * horizon]]}
+             for i, rid in enumerate(request_ids)
+@@ -606,23 +585,21 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         self,
+         noisy_actions: torch.Tensor,
+         fraction: torch.Tensor,
+-        time_emb_buffer: torch.Tensor,
+         **kwargs,
+     ) -> NameToTensorList:
+         """Single-request action_gen forward (called from _execute_sequential)."""
+-        return {"actions": [self._denoise(noisy_actions, fraction=fraction, time_emb_buffer=time_emb_buffer)]}
++        return {"actions": [self._denoise(noisy_actions, fraction=fraction)]}
+ 
+-    def _denoise(
+-        self,
+-        noisy_actions: torch.Tensor,
+-        fraction: torch.Tensor,
+-        time_emb_buffer: torch.Tensor,
+-    ) -> torch.Tensor:
++    def _denoise(self, noisy_actions: torch.Tensor, fraction: torch.Tensor) -> torch.Tensor:
+         """Run all ``num_flow_steps`` Euler steps from t=1 to t=0.
+ 
++        The adaRMS conditioning depends only on the step, so the time
++        embedding, ``time_mlp`` and every norm's modulation are computed for
++        all steps at once, in float32 as openpi computes them, and shared by
++        every request in the batch.
++
+         Args:
+             noisy_actions: [N * horizon, action_dim], the initial noise.
+-            time_emb_buffer: [N, action_hidden_size] scratch for the timestep embedding.
+ 
+         Returns:
+             The denoised actions, same shape as ``noisy_actions``.
+@@ -630,21 +607,23 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         config = self.config
+         num_steps = config.num_flow_steps
+         dt = -1.0 / num_steps
+-        actions = noisy_actions
+-        for step in range(num_steps):
+-            idx = time_emb_buffer.new_full((time_emb_buffer.shape[0],), float(step))
++        with torch.autocast(noisy_actions.device.type, enabled=False):
++            steps = torch.arange(num_steps, device=noisy_actions.device, dtype=torch.float32)
+             time_emb = sincos_timestep_embedding(
+-                1.0 - idx / num_steps,
++                1.0 - steps / num_steps,
+                 dim=config.action_hidden_size,
+                 fraction=fraction,
+-                output_buffer=time_emb_buffer,
++                output_buffer=steps.new_empty(num_steps, config.action_hidden_size),
+                 min_period=config.timestep_min_period,
+                 max_period=config.timestep_max_period,
+             )
+-            adarms_cond = self.time_mlp(time_emb)
++            layer_mods, final_mod = self.action_expert.modulations(self.time_mlp(time_emb))
++        actions = noisy_actions
++        for step in range(num_steps):
+             suffix_out = self.action_expert(
+                 query_sequence=self.action_in_proj(actions),
+-                adarms_cond=adarms_cond,
++                layer_modulations=[mod[step] for mod in layer_mods],
++                final_modulation=final_mod[step],
+                 label="main",
+             )
+             actions = euler_step(actions, self.action_out_proj(suffix_out), dt)
+diff --git a/test/modular/test_pi05_reference_equivalence.py b/test/modular/test_pi05_reference_equivalence.py
+index 25e4c9a7a..fb6f2933b 100644
+--- a/test/modular/test_pi05_reference_equivalence.py
++++ b/test/modular/test_pi05_reference_equivalence.py
+@@ -503,10 +503,10 @@ def test_action_expert_layer_matches_reference_single_request():
+ 
+     handle = MockKVAttention(scale=config.head_dim ** -0.5)
+     _bind_mock_resources(ours, handle)
+-    ours_out = ours(
+-        hidden_states=x.to(MSTAR_DTYPE),
+-        adarms_cond=cond.unsqueeze(0).to(MSTAR_DTYPE),
+-    ).to(torch.float32)
++    # The layer's norms take their modulations, precomputed from the condition.
++    c = cond.unsqueeze(0).to(MSTAR_DTYPE)
++    modulations = torch.cat([ours.input_layernorm.dense(c), ours.post_attention_layernorm.dense(c)])
++    ours_out = ours(hidden_states=x.to(MSTAR_DTYPE), adarms_cond=modulations).to(torch.float32)
+ 
+     ref_out, _, _ = ref_layer(x, cond=cond)
+     assert ours_out.shape == ref_out.shape
+@@ -570,9 +570,11 @@ def test_action_expert_full_stack_matches_reference_against_prefix_kv_cache():
+ 
+     suffix = torch.randn(config.action_horizon, config.hidden_size, device=DEVICE, dtype=torch.float32)
+     cond = torch.randn(config.hidden_size, device=DEVICE, dtype=torch.float32)
++    layer_mods, final_mod = ours.modulations(cond.unsqueeze(0).to(MSTAR_DTYPE))
+     ours_out = ours(
+         query_sequence=suffix.to(MSTAR_DTYPE),
+-        adarms_cond=cond.unsqueeze(0).to(MSTAR_DTYPE),
++        layer_modulations=[mod[0] for mod in layer_mods],
++        final_modulation=final_mod[0],
+         label="main",
+     ).to(torch.float32)
+ 

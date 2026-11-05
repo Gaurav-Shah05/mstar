@@ -1,0 +1,37 @@
+diff --git a/mstar/model/pi05/submodules.py b/mstar/model/pi05/submodules.py
+index 1dafdd9a9..8b59e6140 100644
+--- a/mstar/model/pi05/submodules.py
++++ b/mstar/model/pi05/submodules.py
+@@ -274,8 +274,6 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         "time_mlp.",  # the adaRMS condition
+     )
+ 
+-    # For the default image size and a simple text prompt, one request is about 400 tokens
+-    PREFILL_TOKEN_BUCKETS = [512, 1024, 1800] # 2048 was giving OOM
+     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
+     ACTION_GEN_CAPTURE_BATCH_SIZES = [1, 2, 4]
+ 
+@@ -351,6 +349,14 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         emb = self.embed_tokens(ids)
+         return emb * self._text_embed_scale
+ 
++    def _prefill_token_buckets(self) -> list[int]:
++        """One and two requests' longest prefixes, so prefill pads as little as
++        it can at the batch sizes it runs most. Longer steps run eagerly at their
++        exact length, which measured faster than a graph this large, padded."""
++        cfg = self.config
++        longest = cfg.num_cameras * cfg.tokens_per_image + cfg.max_lang_tokens
++        return sorted({512, longest, 2 * longest})
++
+     def get_accelerator_graph_configs(
+         self, device: torch.device, tp_world_size: int = 1,
+     ) -> list[AcceleratorGraphConfig]:
+@@ -382,7 +388,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+                         n, self.config.hidden_size, device=device, dtype=torch.float32
+                     ),
+                 ),
+-                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
++                capture_token_lengths=self._prefill_token_buckets(),
+                 capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+                 compile=True,
+             ),

@@ -1,0 +1,228 @@
+diff --git a/mstar/api_server/data_worker.py b/mstar/api_server/data_worker.py
+index 588323b00..d7b718e8e 100644
+--- a/mstar/api_server/data_worker.py
++++ b/mstar/api_server/data_worker.py
+@@ -11,7 +11,7 @@ from collections import deque
+ from collections.abc import Callable, Collection
+ from concurrent.futures import Future
+ from dataclasses import dataclass, field
+-from functools import cached_property
++from functools import cached_property, partial
+ from typing import NamedTuple
+ 
+ import torch
+@@ -47,7 +47,16 @@ from mstar.communication.tensors import (
+ from mstar.engine.resources.kv.config import KVSpec, prefix_caches_by_rank
+ from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
+ from mstar.engine.resources.spec import apply_yaml_overrides
+-from mstar.model.base import ClientChunk, Model, PrefixKeys, ProcessPromptOutput, Span, keyed_labels, names_checkpoint
++from mstar.model.base import (
++    ClientChunk,
++    Model,
++    PrefixKeys,
++    ProcessPromptOutput,
++    Span,
++    TensorAndMetadata,
++    keyed_labels,
++    names_checkpoint,
++)
+ from mstar.model.media_limits import (
+     RequestMediaBudget,
+     charge_decoded_audio,
+@@ -640,6 +649,7 @@ class PreprocessWorkerThread:
+     # None (no model that declares it, one CPU's worth of workers, or a thread
+     # built without __init__) prepares every request inline
+     _prepare_pool: ThreadPool | None = None
++    _decode_pool: ThreadPool | None = None
+     # Appends handled per pass before output delivery gets its turn again: one
+     # for each of up to 32 live calls appending at once. An append costs a file
+     # decode, far less than a request's preprocess, which is one per pass.
+@@ -752,6 +762,10 @@ class PreprocessWorkerThread:
+             self._prepare_pool = ThreadPool(
+                 max_workers=self._prepare_workers, thread_name_prefix="mstar-prepare",
+             )
++        if getattr(self.model, "PREPROCESS_PARALLEL", False):
++            self._decode_pool = ThreadPool(
++                max_workers=cpus.plan().preprocess_threads, thread_name_prefix="mstar-decode",
++            )
+         # Requests on the prepare pool, oldest first. They reach the conductor
+         # in this order, whichever finishes first.
+         self._preparing: deque[PreparingInput] = deque()
+@@ -818,18 +832,25 @@ class PreprocessWorkerThread:
+             input_metadata[key] = []
+             if modality not in ("image", "audio", "video"):
+                 continue
+-            load = getattr(self.model, f"load_{modality}")
+-            for filepath in paths:
+-                with budget.file():
+-                    if modality == "audio":
+-                        check_audio_duration(filepath)
+-                    out = load(filepath, self.device)
+-                    if modality == "audio":
+-                        charge_decoded_audio(out.data, out.metadata["sample_rate"])
++            load_file = partial(self._load_file, budget, modality)
++            # A request's images decode at once where the model's loaders may
++            # overlap: decoders release the GIL, and at one request in flight
++            # a robot's cameras are most of the time spent here.
++            pool = self._decode_pool if modality == "image" and len(paths) > 1 else None
++            for out in (pool.map(load_file, paths) if pool is not None else map(load_file, paths)):
+                 tensors[key].append(out.data)
+                 input_metadata[key].append(out.metadata)
+         return tensors, input_metadata
+ 
++    def _load_file(self, budget: RequestMediaBudget, modality: str, filepath: str) -> TensorAndMetadata:
++        with budget.file():
++            if modality == "audio":
++                check_audio_duration(filepath)
++            out = getattr(self.model, f"load_{modality}")(filepath, self.device)
++            if modality == "audio":
++                charge_decoded_audio(out.data, out.metadata["sample_rate"])
++        return out
++
+     def _process_input(
+         self, input: PreprocessInput, profile: DataWorkerProfile | None = None,
+     ):
+@@ -2092,3 +2113,5 @@ class PreprocessWorkerThread:
+             self._encode_pool.shutdown(wait=False, cancel_futures=True)
+         if self._prepare_pool is not None:
+             self._prepare_pool.shutdown(wait=False, cancel_futures=True)
++        if self._decode_pool is not None:
++            self._decode_pool.shutdown(wait=False, cancel_futures=True)
+diff --git a/mstar/model/media_limits.py b/mstar/model/media_limits.py
+index 32ae2c2be..81c5c7d46 100644
+--- a/mstar/model/media_limits.py
++++ b/mstar/model/media_limits.py
+@@ -10,6 +10,9 @@ a request's files inside :class:`RequestMediaBudget`, every check also counts
+ against what the request's earlier files used.
+ """
+ import os
++import struct
++import threading
++import zlib
+ from contextlib import contextmanager
+ from contextvars import ContextVar
+ 
+@@ -101,6 +104,7 @@ def check_media_limits() -> None:
+ 
+ 
+ _request_budget: ContextVar["RequestMediaBudget | None"] = ContextVar("mstar_request_media_budget", default=None)
++_file_charges: ContextVar["dict[str, float] | None"] = ContextVar("mstar_request_file_charges", default=None)
+ 
+ 
+ class RequestMediaBudget:
+@@ -126,29 +130,40 @@ class RequestMediaBudget:
+             )
+         self.limits = {"image": max_image_pixels(), "video": max_video_pixels(), "audio": max_audio_seconds()}
+         self.used = dict.fromkeys(self.limits, 0)
+-        self._file = dict.fromkeys(self.limits, 0)
++        # one entry per file being loaded: files of a request may load at once
++        self._loading: list[dict[str, float]] = []
++        self._lock = threading.Lock()
+ 
+     @contextmanager
+     def file(self):
+         """Load one file. It is charged the most any single check counted for
+         it, so a header estimate and the decode after it are not added up."""
++        charges = dict.fromkeys(self.limits, 0)
++        with self._lock:
++            self._loading.append(charges)
+         token = _request_budget.set(self)
++        charges_token = _file_charges.set(charges)
+         try:
+             yield
+         finally:
++            _file_charges.reset(charges_token)
+             _request_budget.reset(token)
+-            for kind, amount in self._file.items():
+-                self.used[kind] += amount
+-                self._file[kind] = 0
++            with self._lock:
++                self._loading = [file for file in self._loading if file is not charges]
++                for kind, amount in charges.items():
++                    self.used[kind] += amount
+ 
+     def charge(self, kind: str, amount: float) -> None:
+-        self._file[kind] = max(self._file[kind], amount)
+-        if self.used[kind] + self._file[kind] > self.limits[kind]:
+-            files, unit, env = self._LIMITS[kind]
+-            raise ValueError(
+-                f"the request's {files} decode to more than {self.limits[kind]} {unit} together; "
+-                f"send fewer or smaller files (the limit is {env})"
+-            )
++        charges = _file_charges.get()
++        with self._lock:
++            charges[kind] = max(charges[kind], amount)
++            loading = sum(file[kind] for file in self._loading)
++            if self.used[kind] + loading > self.limits[kind]:
++                files, unit, env = self._LIMITS[kind]
++                raise ValueError(
++                    f"the request's {files} decode to more than {self.limits[kind]} {unit} together; "
++                    f"send fewer or smaller files (the limit is {env})"
++                )
+ 
+ 
+ def _charge_request(kind: str, amount: float) -> None:
+@@ -339,6 +354,35 @@ def check_image_size(filepath: str, formats: tuple[str, ...] = IMAGE_FORMATS) ->
+     return fmt, animated
+ 
+ 
++# Chunks that can sit before a PNG's image data without changing what Pillow
++# reports for it. Any other chunk (tRNS, acTL, ...) goes through Pillow.
++_PLAIN_PNG_CHUNKS = frozenset({b"sRGB", b"gAMA", b"cHRM", b"pHYs", b"tIME", b"tEXt", b"zTXt", b"iTXt"})
++
++
++def _plain_rgb_png_size(filepath: str) -> tuple[int, int] | None:
++    """Width and height of an ordinary 8-bit RGB PNG, read straight from its
++    header. ``None`` for anything else, including any malformed file, which is
++    left for Pillow to judge. ``Image.open`` costs about 0.4 ms with the GIL
++    held, which a request's camera frames would pay in series even when their
++    decodes overlap."""
++    with open(filepath, "rb") as f:
++        head = f.read(4096)
++    if head[:16] != b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR" or len(head) < 41:
++        return None
++    width, height, depth, color, compression, filtering, interlace, crc = struct.unpack(">IIBBBBBI", head[16:33])
++    if (depth, color, compression, filtering, interlace) != (8, 2, 0, 0, 0) or zlib.crc32(head[12:29]) != crc:
++        return None
++    offset = 33
++    while offset + 8 <= len(head):
++        length, kind = struct.unpack(">I4s", head[offset:offset + 8])
++        if kind == b"IDAT":
++            return width, height
++        if kind not in _PLAIN_PNG_CHUNKS:
++            return None
++        offset += length + 12
++    return None
++
++
+ def _check_image_header(filepath: str, formats: tuple[str, ...]) -> tuple[str, bool, str, bool]:
+     """:func:`check_image_size`, plus Pillow's mode and whether the file
+     carries transparency (an alpha channel or a tRNS or GIF transparent color)."""
+@@ -347,6 +391,14 @@ def _check_image_header(filepath: str, formats: tuple[str, ...]) -> tuple[str, b
+     from PIL import Image, UnidentifiedImageError
+ 
+     limit = max_image_pixels()
++    if "PNG" in formats:
++        try:
++            size = _plain_rgb_png_size(filepath)
++        except OSError:
++            size = None
++        if size is not None and 0 < size[0] * size[1] <= limit:
++            _charge_request("image", size[0] * size[1])
++            return "PNG", False, "RGB", False
+     try:
+         with warnings.catch_warnings():
+             warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+diff --git a/mstar/model/pi05/pi05_model.py b/mstar/model/pi05/pi05_model.py
+index cdde3672e..8ce99523d 100644
+--- a/mstar/model/pi05/pi05_model.py
++++ b/mstar/model/pi05/pi05_model.py
+@@ -147,6 +147,8 @@ class Pi05Model(Model):
+     """Pi0.5 vision-language-action model implementation."""
+ 
+     PREPROCESS_ONLY_KWARGS = ("robot_state",)
++    # load_image and process_prompt read no shared state but the fast tokenizer's
++    PREPROCESS_PARALLEL = True
+ 
+     PREFILL_WALK = "prefill"
+     ACTION_GEN_WALK = "action_gen"

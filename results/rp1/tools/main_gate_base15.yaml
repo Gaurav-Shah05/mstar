@@ -1,0 +1,17 @@
+# Gate-only config for the port: what the openpi reference ran (pi05_base, 3 cameras, horizon 15).
+model: "pi05"
+max_seq_len: 2048
+model_kwargs:
+  action_horizon: 15
+resources:
+  attn:
+    flashinfer_backend: fa2
+node_groups:
+  - node_names:
+      - vit_encoder
+    ranks:
+      - 0
+  - node_names:
+      - LLM
+    ranks:
+      - 0

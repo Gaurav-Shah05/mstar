@@ -1,0 +1,34 @@
+--- a/mstar/model/pi05/submodules.py	2026-11-03 14:33:07.000000000 +0000
++++ b/mstar/model/pi05/submodules.py	2026-11-03 15:01:00.000000000 +0000
+@@ -275,8 +275,6 @@
+         "time_mlp.",  # the adaRMS condition, fp32 in openpi too
+     )
+ 
+-    # For the default image size and a simple text prompt, one request is about 400 tokens
+-    PREFILL_TOKEN_BUCKETS = [512, 1024, 1800] # 2048 was giving OOM
+     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
+     ACTION_GEN_CAPTURE_BATCH_SIZES = [1, 2, 4]
+ 
+@@ -387,12 +385,21 @@
+                         n, self.config.hidden_size, device=device, dtype=torch.float32
+                     ),
+                 ),
+-                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
++                # n requests' longest prefixes, for each captured batch size n
++                capture_token_lengths=[
++                    n * self._max_prefix_tokens() for n in self.PREFILL_CAPTURE_BATCH_SIZES
++                ],
+                 capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+                 compile=True,
+             ),
+         ]
+ 
++    def _max_prefix_tokens(self) -> int:
++        """The longest prefix one request can have: every camera's image
++        tokens plus the longest prompt ``Pi05Tokenizer`` keeps."""
++        cfg = self.config
++        return cfg.num_cameras * cfg.tokens_per_image + cfg.max_lang_tokens
++
+     def prepare_inputs(
+         self,
+         graph_walk: str,

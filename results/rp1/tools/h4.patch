@@ -1,0 +1,194 @@
+diff --git a/mstar/model/pi05/submodules.py b/mstar/model/pi05/submodules.py
+index 7e4cf782f..d03f7bc83 100644
+--- a/mstar/model/pi05/submodules.py
++++ b/mstar/model/pi05/submodules.py
+@@ -24,6 +24,7 @@ from mstar.engine.accelerator_graph_config import (
+     BatchedAcceleratorGraphConfig,
+     PackedAcceleratorGraphConfig,
+ )
++from mstar.engine.accelerator_graph_runner import DEFAULT_CAPTURE_BATCH_SIZES
+ from mstar.engine.engine import ExecutingBatch
+ from mstar.engine.resources import AttentionStep, KVStep, PositionStep, Segment, SlotLease, SubmoduleStep
+ from mstar.model.pi05.components.action_expert import Pi05ActionExpert, Pi05TimeMLP
+@@ -151,13 +152,10 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
+         )
+ 
+     def get_accelerator_graph_configs(self, device: torch.device, tp_world_size: int = 1) -> list:
+-        """CUDA graph capture config for the SigLIP encoder.
+-
+-        Captures the batched encoder forward for bs ∈ [1, 2, 4] during the
+-        'prefill' walk. Each capture slot holds one request's pixel_values:
+-        (num_cameras, 3, H, W). preprocess() stacks them to (bs, num_cameras,
+-        3, H, W) so shape[0] == bs, satisfying StatelessCudaGraphRunner's
+-        leading-dim == bs requirement.
++        """CUDA graph capture config for the SigLIP encoder, at the engine's
++        default batch sizes. Each capture row holds one request's
++        ``(num_cameras, 3, H, W)`` pixel_values; preprocess() stacks the rows
++        so shape[0] == bs.
+ 
+         compile=False because warmup() already applies torch.compile to
+         forward_batched; _capture_one captures the compiled callable directly.
+@@ -176,7 +174,6 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
+                         )
+                     },
+                 ),
+-                capture_batch_sizes=[1],
+                 compile=False,
+             )
+         ]
+@@ -285,10 +282,6 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         ".norm.",   # final RMSNorm / adaRMS norm
+     )
+ 
+-    # For the default image size and a simple text prompt, one request is about 400 tokens
+-    PREFILL_TOKEN_BUCKETS = [512, 1024, 1800] # 2048 was giving OOM
+-    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
+-    ACTION_GEN_CAPTURE_BATCH_SIZES = [1, 2, 4]
+ 
+     def __init__(
+         self,
+@@ -314,11 +307,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         # input normalizer, and ``embed_tokens`` here is a plain nn.Embedding.
+         self._text_embed_scale = math.sqrt(config.hidden_size)
+ 
+-        # Lazily allocated on the first action_gen step, sized for the largest
+-        # captured batch. sincos_timestep_embedding fully overwrites this buffer
+-        # every step, so torch.empty suffices (no zeroing needed).
+         self._fraction: torch.Tensor | None = None
+-        self._time_emb_buffer: torch.Tensor | None = None
+ 
+     def to(self, *args, **kwargs):
+         """Apply standard ``to()`` then upcast norm parameters back to fp32.
+@@ -366,22 +355,6 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         )
+         return self._fraction
+ 
+-    def _get_time_emb_buffer(self, bs: int) -> torch.Tensor:
+-        """Return a pre-allocated slice of shape (bs, action_hidden_size).
+-
+-        Allocated once at the largest capture batch size (float32, matching
+-        noisy_actions dtype). sincos_timestep_embedding fully overwrites it
+-        every step, so no zeroing is needed — torch.empty suffices.
+-        """
+-        max_bs = max(self.ACTION_GEN_CAPTURE_BATCH_SIZES)
+-        if self._time_emb_buffer is None:
+-            self._time_emb_buffer = torch.empty(
+-                max_bs, self.config.action_hidden_size,
+-                device=self.get_device(),
+-                dtype=torch.float32,
+-            )
+-        return self._time_emb_buffer[:bs]
+-
+     def _embed_tokens_scaled(self, ids: torch.Tensor) -> torch.Tensor:
+         emb = self.embed_tokens(ids)
+         return emb * self._text_embed_scale
+@@ -405,24 +378,36 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+                         ),
+                     }
+                 ),
+-                capture_batch_sizes=self.ACTION_GEN_CAPTURE_BATCH_SIZES
+             ),
+-            PackedAcceleratorGraphConfig(
+-                # max-autotune until the default compile level (mstar serve -O) is measured on this model
+-                compile_mode="max-autotune-no-cudagraphs",
+-                capture_graph_walk="prefill",
+-                make_node_input=lambda n: ARNodeInputs(
+-                    input_seq_len=n,
+-                    input_embeds=torch.zeros(
+-                        n, self.config.hidden_size, device=device
++            # One prefill capture per batch size, sized for that many of the
++            # longest prefixes a request can have: compiled code is keyed by
++            # token count, so pairing each batch size with one count keeps the
++            # compiles to one per batch size.
++            *(
++                PackedAcceleratorGraphConfig(
++                    # max-autotune until the default compile level (mstar serve -O) is measured on this model
++                    compile_mode="max-autotune-no-cudagraphs",
++                    capture_graph_walk="prefill",
++                    make_node_input=lambda n: ARNodeInputs(
++                        input_seq_len=n,
++                        input_embeds=torch.zeros(
++                            n, self.config.hidden_size, device=device
++                        ),
+                     ),
+-                ),
+-                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
+-                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+-                compile=True,
++                    capture_token_lengths=[bs * self._max_prefix_tokens()],
++                    capture_batch_sizes=[bs],
++                    compile=True,
++                )
++                for bs in DEFAULT_CAPTURE_BATCH_SIZES
+             ),
+         ]
+ 
++    def _max_prefix_tokens(self) -> int:
++        """The longest prefix one request can have: every camera's image
++        tokens plus the longest prompt ``Pi05Tokenizer`` keeps."""
++        cfg = self.config
++        return cfg.num_cameras * cfg.tokens_per_image + cfg.max_lang_tokens
++
+     def prepare_inputs(
+         self,
+         graph_walk: str,
+@@ -532,7 +517,6 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         return {
+             "noisy_actions": cat_noisy,
+             "fraction": self._get_timestep_emb_fraction(),
+-            "time_emb_buffer": self._get_time_emb_buffer(len(inputs))
+         }
+ 
+     # ------------------------------------------------------------------
+@@ -591,12 +575,11 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         request_ids: list[str],
+         noisy_actions: torch.Tensor,
+         fraction: torch.Tensor,
+-        time_emb_buffer: torch.Tensor,
+         **kwargs
+     ) -> dict[str, NameToTensorList]:
+         """Batched action_gen: the denoising loop over the concatenated rows, then split per-request."""
+         horizon = self.config.action_horizon
+-        actions = self._denoise(noisy_actions, fraction=fraction, time_emb_buffer=time_emb_buffer)
++        actions = self._denoise(noisy_actions, len(request_ids), fraction=fraction)
+         return {
+             rid: {"actions": [actions[i * horizon:(i + 1) * horizon]]}
+             for i, rid in enumerate(request_ids)
+@@ -614,23 +597,22 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         self,
+         noisy_actions: torch.Tensor,
+         fraction: torch.Tensor,
+-        time_emb_buffer: torch.Tensor,
+         **kwargs,
+     ) -> NameToTensorList:
+         """Single-request action_gen forward (called from _execute_sequential)."""
+-        return {"actions": [self._denoise(noisy_actions, fraction=fraction, time_emb_buffer=time_emb_buffer)]}
++        return {"actions": [self._denoise(noisy_actions, 1, fraction=fraction)]}
+ 
+     def _denoise(
+         self,
+         noisy_actions: torch.Tensor,
++        num_requests: int,
+         fraction: torch.Tensor,
+-        time_emb_buffer: torch.Tensor,
+     ) -> torch.Tensor:
+         """Run all ``num_flow_steps`` Euler steps from t=1 to t=0.
+ 
+         Args:
+             noisy_actions: [N * horizon, action_dim], the initial noise.
+-            time_emb_buffer: [N, action_hidden_size] scratch for the timestep embedding.
++            num_requests: N.
+ 
+         Returns:
+             The denoised actions, same shape as ``noisy_actions``.
+@@ -639,8 +621,9 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         num_steps = config.num_flow_steps
+         dt = -1.0 / num_steps
+         actions = noisy_actions
++        time_emb_buffer = noisy_actions.new_empty(num_requests, config.action_hidden_size)
+         for step in range(num_steps):
+-            idx = time_emb_buffer.new_full((time_emb_buffer.shape[0],), float(step))
++            idx = time_emb_buffer.new_full((num_requests,), float(step))
+             time_emb = sincos_timestep_embedding(
+                 1.0 - idx / num_steps,
+                 dim=config.action_hidden_size,

@@ -1,0 +1,1 @@
+test/modular/test_dynamo_bridges.py test/modular/test_dynamo_registration_smoke.py test/modular/test_kv_prefix_bagel_parity.py test/modular/test_model_kwargs_tensor_transport.py test/modular/test_openai_adapters.py test/modular/test_openai_router.py test/modular/test_pi05_reference_equivalence.py test/modular/test_pi05_model.py test/modular/test_pi05_siglip_keys.py 

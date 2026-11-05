@@ -1,0 +1,165 @@
+diff --git a/mstar/model/pi05/pi05_model.py b/mstar/model/pi05/pi05_model.py
+index 18f43378b..8d7783f48 100644
+--- a/mstar/model/pi05/pi05_model.py
++++ b/mstar/model/pi05/pi05_model.py
+@@ -528,6 +528,16 @@ class Pi05Model(Model):
+                 }
+             return {}
+ 
++        cfg = self.config
++        # SigLIP is captured for num_cameras images and the prefix KV layout
++        # below reserves their tokens, so a request carries exactly that many.
++        num_images = len((kwargs.get("tensors") or {}).get("image_inputs", ()))
++        if num_images != cfg.num_cameras:
++            raise ValueError(
++                f"Pi0.5 takes exactly {cfg.num_cameras} camera images per request "
++                f"(num_cameras), got {num_images}"
++            )
++
+         cleaned = (prompt or "").strip().replace("_", " ").replace("\n", " ")
+ 
+         robot_state = kwargs.get("robot_state")
+@@ -546,8 +556,6 @@ class Pi05Model(Model):
+             full_prompt = cleaned
+ 
+         text_ids = self.tokenizer.encode_prompt(full_prompt)
+-        cfg = self.config
+-        # a captured SigLIP step encodes all num_cameras slots, however many images the request has
+         images = cfg.num_cameras * (cfg.vit_image_size // cfg.vit_patch_size) ** 2
+         layout = LabelLayout(
+             spans=(
+@@ -564,6 +572,9 @@ class Pi05Model(Model):
+         camera and stages a quarter of the bytes for the worker."""
+         return TensorAndMetadata(read_image(filepath, rgb=True).to(device))
+ 
++    def max_input_files(self) -> dict[str, int]:
++        return {"image": self.config.num_cameras}
++
+     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+         return {LLM_KV: {"main": KVLabel()}}
+ 
+diff --git a/mstar/model/pi05/submodules.py b/mstar/model/pi05/submodules.py
+index dde4e57f7..bcc50a529 100644
+--- a/mstar/model/pi05/submodules.py
++++ b/mstar/model/pi05/submodules.py
+@@ -188,8 +188,10 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
+         inputs: NameToTensorList,
+         **kwargs
+     ) -> NodeInputs:
+-        return NodeInputs(tensor_inputs={"pixel_values": self._prepare_one(
+-            inputs["image_inputs"][0]
++        # One [C, H, W] image per camera, in order; each is letterboxed on its own
++        # since cameras can differ in resolution.
++        return NodeInputs(tensor_inputs={"pixel_values": torch.cat(
++            [self._prepare_one(image) for image in inputs["image_inputs"]]
+         )})
+ 
+     def preprocess(
+@@ -308,27 +310,11 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         self.action_out_proj = action_out_proj
+         self.time_mlp = time_mlp
+         self.config = config
+-        # Image features and language token embeddings use DIFFERENT scaling
+-        # factors in lerobot's reference, even though both end up calling it
+-        # ``sqrt(hidden_size)``:
+-        #
+-        #   * Images: ``embed_image`` returns
+-        #     ``connector(siglip_features) * sqrt(hidden_size)``  -> scale = sqrt(H).
+-        #
+-        #   * Text: lerobot's ``lang_embed_func`` does
+-        #     ``embed_language_tokens(tokens) * sqrt(hidden_size)``, but
+-        #     ``embed_language_tokens`` calls HF Gemma's
+-        #     ``GemmaTextScaledWordEmbedding`` whose ``forward`` already
+-        #     multiplies the raw lookup by an internal ``embed_scale =
+-        #     sqrt(hidden_size)``. So the EFFECTIVE text scale is
+-        #     ``sqrt(H) * sqrt(H) = H``, not ``sqrt(H)``.
+-        #
+-        # We use a plain ``nn.Embedding`` for ``embed_tokens`` (no internal
+-        # scale), so we have to apply the full ``H`` factor manually here.
+-        # Mismatching this produces a ~45x undersized text prefix and the
+-        # action expert sees a wildly wrong context.
+-        self._image_embed_scale = math.sqrt(config.hidden_size)
+-        self._text_embed_scale = float(config.hidden_size)
++        # Prefix scaling as openpi's embed_prefix does it
++        # (models_pytorch/pi0_pytorch.py): SigLIP tokens unscaled, language
++        # embeddings times sqrt(hidden_size). openpi's Gemma skips its own
++        # input normalizer, and ``embed_tokens`` here is a plain nn.Embedding.
++        self._text_embed_scale = math.sqrt(config.hidden_size)
+ 
+         # Lazily allocated on first action Euler step, sized for the largest
+         # captured batch. sincos_timestep_embedding fully overwrites this buffer
+@@ -463,24 +449,10 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         inputs: NameToTensorList,
+         **kwargs
+     ) -> ARNodeInputs:
+-        # Pi0.5 prefix layout (matches lerobot's embed_prefix):
+-        #   [image_tokens, language_tokens]
+-        # The robot state is *not* a separate token stream — it has already
+-        # been formatted as a decimal-string suffix on the language prompt
+-        # by ``Pi05Model.process_prompt``, then tokenized by the PaliGemma
+-        # tokenizer. So the LLM only consumes ``img_emb`` + ``text_inputs``.
+-        #
+-        # IMPORTANT: lerobot's ``embed_prefix`` scales BOTH the image features
+-        # (after the multi_modal_projector) and the language token embeddings
+-        # by ``sqrt(hidden_size)``. We mirror that here. Without the image
+-        # scaling the SigLIP tokens come in ~sqrt(2048)≈45x too small relative
+-        # to the language tokens and the action expert sees a wildly wrong
+-        # prefix. (The standalone test_pi05_model_loaded_via_remapper_matches_
+-        # lerobot integration test missed this because it bypasses
+-        # _preprocess_prefill and feeds in lerobot's pre-scaled embed_prefix
+-        # output directly.)
+-
+-        img_emb = inputs["img_emb"][0] * self._image_embed_scale
++        # Prefix layout [image_tokens, language_tokens], as openpi's
++        # embed_prefix. The robot state is part of the language tokens:
++        # ``Pi05Model.process_prompt`` writes it into the prompt.
++        img_emb = inputs["img_emb"][0]
+         text_ids = inputs["text_inputs"][0]
+         text_emb = self._embed_tokens_scaled(text_ids)
+         prefix_emb = torch.cat([img_emb, text_emb], dim=0)
+diff --git a/test/modular/test_pi05_model.py b/test/modular/test_pi05_model.py
+index 06eb32a46..7b7617c36 100644
+--- a/test/modular/test_pi05_model.py
++++ b/test/modular/test_pi05_model.py
+@@ -351,6 +351,22 @@ def test_pi05_refuses_to_start_without_a_tokenizer(monkeypatch):
+         model._load_tokenizer()
+ 
+ 
++def _camera_tensors(model, n=None):
++    n = model.config.num_cameras if n is None else n
++    return {"image_inputs": [torch.zeros(3, 8, 8, dtype=torch.uint8) for _ in range(n)]}
++
++
++@pytest.mark.parametrize("n", [1, 2, 4])
++def test_pi05_process_prompt_refuses_other_camera_counts(n):
++    model = _make_model()
++    model.tokenizer = _StubTokenizer()
++    with pytest.raises(ValueError, match="exactly 3 camera images"):
++        model.process_prompt(
++            prompt="hi", input_modalities=["image", "text"], output_modalities=["action"],
++            tensors=_camera_tensors(model, n),
++        )
++
++
+ def test_pi05_process_prompt_formats_state_into_text():
+     """Pi05Model.process_prompt should produce the openpi-style template
+     ``"Task: <text>, State: <bin0> <bin1> ... <bin31>;\\nAction: "`` and
+@@ -367,6 +383,7 @@ def test_pi05_process_prompt_formats_state_into_text():
+         input_modalities=["image", "text"],
+         output_modalities=["action"],
+         robot_state=state,
++        tensors=_camera_tensors(model),
+     ).new_input_tensors
+ 
+     # Result is a single text_inputs entry — no separate state_inputs.
+@@ -388,8 +405,9 @@ def test_pi05_process_prompt_without_state_uses_plain_text():
+     model.tokenizer = stub
+     result = model.process_prompt(
+         prompt="hello world",
+-        input_modalities=["text"],
++        input_modalities=["image", "text"],
+         output_modalities=["action"],
++        tensors=_camera_tensors(model),
+     ).new_input_tensors
+     assert "text_inputs" in result
+     assert stub.last_prompt == "hello world"

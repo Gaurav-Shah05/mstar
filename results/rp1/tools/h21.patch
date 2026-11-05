@@ -1,0 +1,259 @@
+diff --git a/mstar/conductor/conductor.py b/mstar/conductor/conductor.py
+index ea18c3d40..67ce54cd6 100644
+--- a/mstar/conductor/conductor.py
++++ b/mstar/conductor/conductor.py
+@@ -1,6 +1,7 @@
+ import atexit
+ import hashlib
+ import logging
++import math
+ import multiprocessing as mp
+ import os
+ import signal
+@@ -2248,6 +2249,23 @@ class Conductor:
+               for name, family in catalog.WORKER_FAMILIES.items()),
+         ])
+ 
++    def _ms_to_next_timed_check(self) -> int:
++        """How long the run loop can wait for a message: until the liveness
++        check, the earliest expiry deadline or the metrics status.
++
++        At least 1 ms. The transports read a negative timeout as forever or as
++        an error, and a check left due by a pass that raised before reaching it
++        must not turn the loop into a spin."""
++        due = self._next_liveness_check
++        if self._status_interval_s is not None:
++            due = min(due, self._next_status)
++        for deadlines in (
++            self._draining_deadlines, self._early_reads_done_deadlines, self._early_abort_deadlines,
++        ):
++            if deadlines:
++                due = min(due, deadlines[0][0])
++        return max(1, math.ceil((due - time.perf_counter()) * 1000))
++
+     def run(self):
+         from mstar.utils.profiler import range_pop, range_push
+ 
+@@ -2315,4 +2333,6 @@ class Conductor:
+             # Outside the try above so DeadWorkerError leaves the loop instead of
+             # being logged as a main-loop error and retried.
+             self._poll_worker_liveness()
+-            time.sleep(0.001)
++            # No wakeup event is registered: nothing in this process makes work
++            # outside a message, and what isn't a message is a timed check.
++            self.communicator.poll_for_messages(timeout_ms=self._ms_to_next_timed_check())
+diff --git a/test/modular/test_client_stream_conductor.py b/test/modular/test_client_stream_conductor.py
+index 80e76ed89..370eccbbf 100644
+--- a/test/modular/test_client_stream_conductor.py
++++ b/test/modular/test_client_stream_conductor.py
+@@ -71,6 +71,9 @@ class _StubComm:
+     def get_all_new_messages(self):
+         return self.batches.popleft() if self.batches else []
+ 
++    def poll_for_messages(self, timeout_ms):
++        return bool(self.batches)
++
+ 
+ class _ScriptDoneError(Exception):
+     pass
+diff --git a/test/modular/test_conductor_tick_exception.py b/test/modular/test_conductor_tick_exception.py
+index c5d4feaed..62c646199 100644
+--- a/test/modular/test_conductor_tick_exception.py
++++ b/test/modular/test_conductor_tick_exception.py
+@@ -99,6 +99,7 @@ def _conductor(*ticks, requests):
+     c.communicator = SimpleNamespace(
+         send=lambda entity, msg: c.sent.append((entity, msg)),
+         get_all_new_messages=lambda: batches.pop(0) if batches else [],
++        poll_for_messages=lambda timeout_ms: bool(batches),
+     )
+     c.model = _Model()
+     c.enable_nvtx = False
+@@ -125,12 +126,12 @@ def _conductor(*ticks, requests):
+         if not batches:
+             raise _StopLoop
+     c._poll_worker_liveness = _poll
++    c._next_liveness_check = 0.0
+     return c
+ 
+ 
+ @pytest.fixture(autouse=True)
+-def _no_sleep_no_freeze(monkeypatch):
+-    monkeypatch.setattr(conductor_mod.time, "sleep", lambda _s: None)
++def _no_freeze(monkeypatch):
+     monkeypatch.setattr(conductor_mod, "freeze_after_setup", lambda _n: None)
+ 
+ 
+diff --git a/test/modular/test_conductor_wait.py b/test/modular/test_conductor_wait.py
+new file mode 100644
+index 000000000..ba610e5de
+--- /dev/null
++++ b/test/modular/test_conductor_wait.py
+@@ -0,0 +1,140 @@
++"""``Conductor.run`` waits on its communicator's poll between passes, over the
++real transports: a message ends the wait at once, and each timed check ends it
++on its own deadline with no message at all, without the loop spinning, whether
++or not a request is in flight."""
++import threading
++import time
++
++import pytest
++
++pytest.importorskip("torch")
++
++import mstar.communication.wire_types  # noqa: E402,F401  (registers the wire tags)
++import mstar.conductor.conductor as conductor_mod  # noqa: E402
++from mstar.api_server.request_types import ConductorStatus  # noqa: E402
++from mstar.communication.communicator import ZMQCommunicator  # noqa: E402
++from mstar.conductor.conductor import Conductor  # noqa: E402
++from mstar.utils.ipc_format import (  # noqa: E402
++    ConductorMessage,
++    ConductorMessageType,
++    ReadsDone,
++)
++
++FAR_S = 60.0  # no check but the one under test comes due during a test
++DUE_S = 0.4
++
++TIMED_CHECKS = {
++    "liveness": lambda c, at: setattr(c, "_next_liveness_check", at),
++    "status": lambda c, at: setattr(c, "_next_status", at),
++    "drain": lambda c, at: c._draining_deadlines.append((at, "r")),
++    "early_reads_done": lambda c, at: c._early_reads_done_deadlines.append((at, "r")),
++    "early_abort": lambda c, at: c._early_abort_deadlines.append((at, "r")),
++}
++
++
++class _StopLoop(BaseException):
++    pass
++
++
++def _communicator(kind, my_id, prefix):
++    if kind == "rust":
++        pytest.importorskip("mstar_rust")
++        from mstar.communication.rust_communicator import RustZMQCommunicator as Comm
++    else:
++        Comm = ZMQCommunicator
++    return Comm(my_id, push_ids=[], ipc_socket_path_prefix=prefix)
++
++
++def _conductor(comm):
++    """The state ``run`` reads; ``_worker_processes`` empty, so nothing is dead."""
++    c = Conductor.__new__(Conductor)
++    c.communicator = comm
++    c.worker_ids, c._worker_processes = [], []
++    c.enable_nvtx = False
++    c._startup_message_backlog = []
++    c.requests, c.draining, c.waiting_queue = {}, {}, []
++    c._early_reads_done, c._early_abort_requests = {}, set()
++    c._draining_deadlines = conductor_mod.deque()
++    c._early_reads_done_deadlines = conductor_mod.deque()
++    c._early_abort_deadlines = conductor_mod.deque()
++    c._drain_ttl_s = FAR_S
++    c._liveness_interval_s = c._status_interval_s = FAR_S
++    c._status = lambda: ConductorStatus(metrics=[])
++    return c
++
++
++def _wait_until(predicate, timeout_s=5.0):
++    deadline = time.monotonic() + timeout_s
++    while not predicate():
++        if time.monotonic() > deadline:
++            return False
++        time.sleep(0.001)
++    return True
++
++
++@pytest.mark.parametrize("kind", ["python", "rust"])
++@pytest.mark.parametrize("check", TIMED_CHECKS)
++@pytest.mark.parametrize("in_flight", [False, True])
++def test_a_message_or_a_timed_check_ends_the_wait(kind, check, in_flight, tmp_path, monkeypatch):
++    monkeypatch.setattr(conductor_mod, "freeze_after_setup", lambda _name: None)
++    prefix = str(tmp_path) + "/"
++    comm = _communicator(kind, "conductor", prefix)
++    peer = _communicator(kind, "peer", prefix)
++    comm.send = lambda entity, msg: None
++    c = _conductor(comm)
++    if in_flight:
++        c.requests["in flight"] = object()
++
++    passes = []
++    drain = comm.get_all_new_messages
++
++    def counted_drain():
++        # after the drain: a message sent once this pass counts can't be read by it
++        messages = drain()
++        passes.append(time.perf_counter())
++        return messages
++
++    comm.get_all_new_messages = counted_drain
++
++    stop = threading.Event()
++    liveness = c._poll_worker_liveness
++
++    def stop_when_told():
++        liveness()
++        if stop.is_set():
++            raise _StopLoop
++
++    c._poll_worker_liveness = stop_when_told
++
++    def run():
++        try:
++            c.run()
++        except _StopLoop:
++            pass
++
++    c._next_liveness_check = c._next_status = 0.0
++    assert c._ms_to_next_timed_check() == 1, "a check already due must not spin the loop"
++
++    now = time.perf_counter()
++    c._next_liveness_check = c._next_status = now + FAR_S
++    due = now + DUE_S
++    TIMED_CHECKS[check](c, due)
++    thread = threading.Thread(target=run, daemon=True)
++    thread.start()
++    try:
++        assert _wait_until(lambda: len(passes) == 1)
++
++        peer.send("conductor", ConductorMessage(ConductorMessageType.READS_DONE, ReadsDone("x", "peer")))
++        assert _wait_until(lambda: "x" in c._early_reads_done)
++        assert passes[1] < due and len(passes) == 2
++
++        # no message from here on: only the deadline can end this wait
++        assert _wait_until(lambda: len(passes) >= 3)
++        assert passes[2] >= due - 0.001
++        time.sleep(0.05)
++        assert len(passes) <= 4, "the loop must go back to waiting"
++    finally:
++        stop.set()
++        peer.send("conductor", ConductorMessage(ConductorMessageType.READS_DONE, ReadsDone("y", "peer")))
++        thread.join(timeout=5.0)
++    assert not thread.is_alive()
+diff --git a/test/modular/test_ingest_unpersist.py b/test/modular/test_ingest_unpersist.py
+index 436ae6092..1789bcaae 100644
+--- a/test/modular/test_ingest_unpersist.py
++++ b/test/modular/test_ingest_unpersist.py
+@@ -46,6 +46,9 @@ class _StubComm:
+     def get_all_new_messages(self):
+         return self.batches.popleft() if self.batches else []
+ 
++    def poll_for_messages(self, timeout_ms):
++        return bool(self.batches)
++
+ 
+ class _ScriptDoneError(Exception):
+     pass
+diff --git a/test/modular/test_kv_layout_intake.py b/test/modular/test_kv_layout_intake.py
+index 69e15b7c8..5e6cd7dc3 100644
+--- a/test/modular/test_kv_layout_intake.py
++++ b/test/modular/test_kv_layout_intake.py
+@@ -52,6 +52,9 @@ class _Comm:
+     def get_all_new_messages(self):
+         return self.batches.popleft() if self.batches else []
+ 
++    def poll_for_messages(self, timeout_ms):
++        return bool(self.batches)
++
+ 
+ class _ScriptDoneError(Exception):
+     pass

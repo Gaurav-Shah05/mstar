@@ -1,0 +1,89 @@
+diff --git a/mstar/model/pi05/components/siglip.py b/mstar/model/pi05/components/siglip.py
+index d017558c8..8d5b4808a 100644
+--- a/mstar/model/pi05/components/siglip.py
++++ b/mstar/model/pi05/components/siglip.py
+@@ -40,9 +40,19 @@ class Pi05SiglipEncoder(nn.Module):
+             config.vit_hidden_size, config.hidden_size, bias=True
+         )
+ 
++    @property
++    def tower(self) -> nn.Module:
++        """The module holding ``embeddings``/``encoder``/``post_layernorm``: the
++        SiglipVisionModel itself in transformers 5.x, its ``vision_model`` in 4.x."""
++        return getattr(self.vision_model, "vision_model", self.vision_model)
++
+     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+         """Encode a batch of images into LLM-space tokens.
+ 
++        As openpi's SigLIP: the patch and position embeddings run in their
++        own (float32) dtype and the encoder, final norm and connector in the
++        connector's dtype.
++
+         Args:
+             pixel_values: Tensor of shape ``(N, 3, H, W)`` where ``N`` is the
+                 total number of images across cameras and requests.
+@@ -50,7 +60,7 @@ class Pi05SiglipEncoder(nn.Module):
+         Returns:
+             Tensor of shape ``(N, tokens_per_image, hidden_size)``.
+         """
+-        outputs = self.vision_model(pixel_values=pixel_values)
+-        # last_hidden_state: [N, num_patches, vit_hidden_size]
+-        features = outputs.last_hidden_state
+-        return self.connector(features)
++        tower = self.tower
++        embeds = tower.embeddings(pixel_values.to(tower.embeddings.patch_embedding.weight.dtype))
++        hidden = tower.encoder(inputs_embeds=embeds.to(self.connector.weight.dtype)).last_hidden_state
++        return self.connector(tower.post_layernorm(hidden))
+diff --git a/mstar/model/pi05/submodules.py b/mstar/model/pi05/submodules.py
+index 6b8846258..145c6df30 100644
+--- a/mstar/model/pi05/submodules.py
++++ b/mstar/model/pi05/submodules.py
+@@ -53,26 +53,17 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
+         self.encoder = encoder
+         self.config = config
+ 
++    # Kept in float32, as openpi keeps them (to_bfloat16_for_selected_params
++    # in models_pytorch/gemma_pytorch.py); everything else runs in bfloat16.
++    _FLOAT32_PARAM_SELECTORS = ("embeddings.patch_embedding.", "embeddings.position_embedding.")
++
+     def to(self, *args, **kwargs):
+-        """Override ``to()`` to always keep the SigLIP vision tower and
+-        connector in float32, matching lerobot's
+-        ``to_bfloat16_for_selected_params`` which explicitly preserves
+-        ``vision_tower`` and ``multi_modal_projector`` in fp32.
+-
+-        Running SigLIP in bf16 produces ~64 abs delta on the image features
+-        (27-layer vision transformer accumulates bf16 rounding), which then
+-        propagates through the prefix KV cache and causes ~0.2 abs delta on
+-        the final actions — too large for production use.
+-        """
+-        # Move to device but FORCE fp32 for all parameters.
+-        # First apply the standard .to() for device placement:
++        """Apply ``to()``, then set openpi's SigLIP precision: bfloat16 except
++        the patch and position embeddings."""
+         result = super().to(*args, **kwargs)
+-        # Then upcast all parameters back to fp32:
+-        for param in result.parameters():
+-            param.data = param.data.to(torch.float32)
+-        for buf in result.buffers():
+-            if buf.is_floating_point():
+-                buf.data = buf.data.to(torch.float32)
++        for name, param in result.named_parameters():
++            keep = any(sel in name for sel in self._FLOAT32_PARAM_SELECTORS)
++            param.data = param.data.to(torch.float32 if keep else torch.bfloat16)
+         return result
+ 
+     def _prepare_one(self, images: torch.Tensor) -> torch.Tensor:
+@@ -217,10 +208,8 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
+     ) -> NameToTensorList:
+         # pixel_values: (1, num_cameras, 3, H, W) from stacked preprocess
+         # (sequential path always has bs=1). Flatten to (num_cameras, 3, H, W)
+-        # before the encoder.
+-        # Disable autocast so SigLIP runs in fp32, matching lerobot's
+-        # to_bfloat16_for_selected_params which keeps vision_tower +
+-        # multi_modal_projector in float32.
++        # before the encoder. Autocast is off: the encoder runs in its
++        # parameters' own dtypes (see ``to``).
+         pv = pixel_values.flatten(0, 1)
+         features = self.encoder(pv.float())
+         # features: [num_cameras, tokens_per_image, hidden]

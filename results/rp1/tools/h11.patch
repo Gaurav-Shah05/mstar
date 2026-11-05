@@ -1,0 +1,178 @@
+diff --git a/configs/pi05.yaml b/configs/pi05.yaml
+index 68dd60130..d508ddeb9 100644
+--- a/configs/pi05.yaml
++++ b/configs/pi05.yaml
+@@ -1,12 +1,13 @@
+ model: "pi05"
+ max_seq_len: 2048
+ 
+-# FlashInfer FA2 rather than the FA3 kernel "auto" picks on SM90 (H100/H200):
+-# the captured action_gen step (10 Euler steps of ~15 action queries over the
+-# ~900-token prefix) 14.0 -> 10.1 ms on an H200, for +0.3 ms of prefill.
++# FlashInfer FA2 for the action expert rather than the FA3 kernel "auto" picks
++# on SM90 (H100/H200): the captured action_gen step (10 Euler steps of ~15
++# action queries over the ~900-token prefix) 14.0 -> 10.1 ms on an H200.
++# Prefill keeps "auto" (FA3 there: 0.3 ms faster than FA2 per request).
+ # Elsewhere "auto" already picks FA2.
+ resources:
+-  attn:
++  action_attn:
+     flashinfer_backend: fa2
+ 
+ node_groups:
+diff --git a/configs/pi05_droid.yaml b/configs/pi05_droid.yaml
+index 8ecbc611e..aae98ff73 100644
+--- a/configs/pi05_droid.yaml
++++ b/configs/pi05_droid.yaml
+@@ -24,12 +24,13 @@ max_seq_len: 2048
+ model_kwargs:
+   action_horizon: 15
+ 
+-# FlashInfer FA2 rather than the FA3 kernel "auto" picks on SM90 (H100/H200):
+-# the captured action_gen step (10 Euler steps of ~15 action queries over the
+-# ~900-token prefix) 14.0 -> 10.1 ms on an H200, for +0.3 ms of prefill.
++# FlashInfer FA2 for the action expert rather than the FA3 kernel "auto" picks
++# on SM90 (H100/H200): the captured action_gen step (10 Euler steps of ~15
++# action queries over the ~900-token prefix) 14.0 -> 10.1 ms on an H200.
++# Prefill keeps "auto" (FA3 there: 0.3 ms faster than FA2 per request).
+ # Elsewhere "auto" already picks FA2.
+ resources:
+-  attn:
++  action_attn:
+     flashinfer_backend: fa2
+ 
+ node_groups:
+diff --git a/mstar/model/pi05/components/action_expert.py b/mstar/model/pi05/components/action_expert.py
+index 89fe52308..1f11b4130 100644
+--- a/mstar/model/pi05/components/action_expert.py
++++ b/mstar/model/pi05/components/action_expert.py
+@@ -25,7 +25,7 @@ from torch import nn
+ 
+ from mstar.model.components import AdaRMSNorm, GatedDecoderLayer
+ from mstar.model.components.distributed import ParallelAttention, ParallelGatedMLP
+-from mstar.model.pi05.config import LLM_ATTN, LLM_KV, LLM_POS, Pi05Config
++from mstar.model.pi05.config import LLM_ACTION_ATTN, LLM_KV, LLM_POS, Pi05Config
+ from mstar.utils.adarms_norm import adarms_norm_fused
+ 
+ 
+@@ -100,7 +100,7 @@ def Pi05ActionExpertLayer(config: Pi05Config) -> GatedDecoderLayer:
+             head_dim=config.head_dim,
+             input_hidden_size=h,
+             rope_theta=config.rope_theta,
+-            attn_key=LLM_ATTN,
++            attn_key=LLM_ACTION_ATTN,
+             kv_key=LLM_KV,
+             pos_key=LLM_POS,
+         ),
+diff --git a/mstar/model/pi05/config.py b/mstar/model/pi05/config.py
+index 1afc00d2e..1b2a09dac 100644
+--- a/mstar/model/pi05/config.py
++++ b/mstar/model/pi05/config.py
+@@ -6,7 +6,8 @@ from dataclasses import dataclass, field
+ # Resource label constants (LLM node: shared by PaliGemma + action expert)
+ # ---------------------------------------------------------------------------
+ LLM_KV = "kv"
+-LLM_ATTN = "attn"
++LLM_ATTN = "attn"  # PaliGemma's prefix attention (prefill walk)
++LLM_ACTION_ATTN = "action_attn"  # the action expert's attention (action_gen walk)
+ LLM_POS = "rope"
+ 
+ 
+diff --git a/mstar/model/pi05/pi05_model.py b/mstar/model/pi05/pi05_model.py
+index cdde3672e..d298813f2 100644
+--- a/mstar/model/pi05/pi05_model.py
++++ b/mstar/model/pi05/pi05_model.py
+@@ -68,6 +68,7 @@ from mstar.model.pi05.components.paligemma import Pi05PaliGemmaExpert
+ from mstar.model.pi05.components.siglip import Pi05SiglipEncoder
+ from mstar.model.pi05.components.tokenization import Pi05Tokenizer
+ from mstar.model.pi05.config import (
++    LLM_ACTION_ATTN,
+     LLM_ATTN,
+     LLM_KV,
+     LLM_POS,
+@@ -426,10 +427,17 @@ class Pi05Model(Model):
+         )
+         return [
+             KVSpec(resource_key=LLM_KV, nodes={"LLM"}, config=kv_config),
++            # Two attentions over the one KV cache, so a deployment can pick a
++            # kernel per walk: prefill's ~900 prefix queries and action_gen's
++            # few action queries over the whole prefix favour different ones.
+             AttentionSpec(
+                 resource_key=LLM_ATTN, nodes={"LLM"},
+                 config=AttentionConfig(kv_cache=LLM_KV),
+             ),
++            AttentionSpec(
++                resource_key=LLM_ACTION_ATTN, nodes={"LLM"},
++                config=AttentionConfig(kv_cache=LLM_KV),
++            ),
+             PositionSpec(
+                 resource_key=LLM_POS, nodes={"LLM"},
+                 config=PositionConfig(kv_cache=LLM_KV),
+diff --git a/mstar/model/pi05/submodules.py b/mstar/model/pi05/submodules.py
+index 1dafdd9a9..3da391299 100644
+--- a/mstar/model/pi05/submodules.py
++++ b/mstar/model/pi05/submodules.py
+@@ -30,7 +30,7 @@ from mstar.model.pi05.components.action_expert import Pi05ActionExpert, Pi05Time
+ from mstar.model.pi05.components.flow_matching import euler_step, sincos_timestep_embedding
+ from mstar.model.pi05.components.paligemma import Pi05PaliGemmaExpert
+ from mstar.model.pi05.components.siglip import Pi05SiglipEncoder
+-from mstar.model.pi05.config import LLM_ATTN, LLM_KV, LLM_POS, Pi05Config
++from mstar.model.pi05.config import LLM_ACTION_ATTN, LLM_ATTN, LLM_KV, LLM_POS, Pi05Config
+ from mstar.model.pi05.kernels.image_normalize import normalize_float_images
+ from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
+ 
+@@ -462,7 +462,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+             segments=segments,
+             steps={
+                 LLM_KV: KVStep(commit=is_prefill),
+-                LLM_ATTN: AttentionStep(causal=False),
++                LLM_ATTN if is_prefill else LLM_ACTION_ATTN: AttentionStep(causal=False),
+                 LLM_POS: pos_step,
+             },
+         )
+diff --git a/test/modular/test_pi05_model.py b/test/modular/test_pi05_model.py
+index ea00e1041..a2ae3fc39 100644
+--- a/test/modular/test_pi05_model.py
++++ b/test/modular/test_pi05_model.py
+@@ -216,19 +216,35 @@ def test_pi05_kv_cache_config_matches_pi05_config():
+ 
+ 
+ @pytest.mark.parametrize("config_name", ["pi05.yaml", "pi05_droid.yaml"])
+-def test_pi05_deployments_pin_flashinfer_fa2(config_name):
+-    """The model keeps FlashInfer's "auto" kernel; the pi05 deployments pin
+-    FA2, and the override has to reach the LLM node's attention."""
++def test_pi05_deployments_pin_fa2_for_the_action_expert_only(config_name):
++    """Both attentions default to FlashInfer's "auto" kernel; the pi05
++    deployments pin FA2 for the action expert's and leave prefill's on auto."""
+     import yaml
+ 
+     from mstar.engine.resources import AttentionSpec
+     from mstar.engine.resources.spec import apply_yaml_overrides
++    from mstar.model.pi05.config import LLM_ACTION_ATTN, LLM_ATTN
+ 
+     specs = _make_model().get_node_resources()
+-    attn = next(spec for spec in specs if isinstance(spec, AttentionSpec))
+-    assert attn.config.flashinfer_backend == "auto"
++    attn = {spec.resource_key: spec for spec in specs if isinstance(spec, AttentionSpec)}
++    assert set(attn) == {LLM_ATTN, LLM_ACTION_ATTN}
++    assert all(spec.config.flashinfer_backend == "auto" for spec in attn.values())
+     apply_yaml_overrides(specs, yaml.safe_load((Path(CONFIG_PATH).parent / config_name).read_text()))
+-    assert attn.config.flashinfer_backend == "fa2"
++    assert attn[LLM_ACTION_ATTN].config.flashinfer_backend == "fa2"
++    assert attn[LLM_ATTN].config.flashinfer_backend == "auto"
++
++
++def test_pi05_walks_declare_their_own_attention():
++    """prefill plans PaliGemma's attention and action_gen the action expert's."""
++    from mstar.model.pi05.config import LLM_ACTION_ATTN, LLM_ATTN
++    from mstar.model.pi05.submodules import Pi05LLMSubmodule
++    from mstar.model.submodule_base import ARNodeInputs
++
++    llm = Pi05LLMSubmodule(None, None, None, None, None, None, Pi05Config())
++    prefill = llm.declare_step("prefill", ["r"], [ARNodeInputs(input_seq_len=900)])
++    action = llm.declare_step("action_gen", ["r"], [ARNodeInputs(input_seq_len=15)])
++    assert LLM_ATTN in prefill and LLM_ACTION_ATTN not in prefill
++    assert LLM_ACTION_ATTN in action and LLM_ATTN not in action
+ 
+ 
+ # ----------------------------------------------------------------------

@@ -1,0 +1,150 @@
+diff --git a/mstar/model/pi05/components/flow_matching.py b/mstar/model/pi05/components/flow_matching.py
+index b3845af3f..0c6d2ce49 100644
+--- a/mstar/model/pi05/components/flow_matching.py
++++ b/mstar/model/pi05/components/flow_matching.py
+@@ -1,6 +1,7 @@
+ """Flow-matching utilities for Pi0.5: timestep embedding, Euler step, state discretization."""
+ 
+ 
++import numpy as np
+ import torch
+ 
+ 
+@@ -55,26 +56,14 @@ def euler_step(
+     return x + dt * velocity
+ 
+ 
+-def discretize_state(
+-    state: torch.Tensor,
+-    num_bins: int = 256,
+-    value_min: float = -1.0,
+-    value_max: float = 1.0,
+-) -> torch.Tensor:
+-    """Map continuous robot state values in [value_min, value_max] to bin indices.
+-
+-    Used by Pi0.5 to tokenize proprioceptive state into language tokens that
+-    PaliGemma can embed alongside image and language tokens.
+-
+-    Args:
+-        state: 1D tensor of state values.
+-        num_bins: number of discrete bins.
+-        value_min / value_max: assumed range of normalized state values.
++def discretize_state(state: torch.Tensor, num_bins: int = 256) -> torch.Tensor:
++    """Bin a normalized robot state into ``num_bins`` bins over [-1, 1], as
++    openpi's pi05 tokenizer does: ``np.digitize(state, linspace(-1, 1,
++    num_bins + 1)[:-1]) - 1``, so a value below -1 maps to -1 and one at or
++    above 1 to ``num_bins - 1``.
+ 
+     Returns:
+-        1D ``torch.long`` tensor of bin indices in ``[0, num_bins)``.
++        1D ``torch.long`` tensor of bin indices.
+     """
+-    clamped = state.clamp(value_min, value_max)
+-    normalized = (clamped - value_min) / (value_max - value_min)
+-    indices = (normalized * (num_bins - 1)).round().to(torch.long)
+-    return indices.clamp(0, num_bins - 1)
++    edges = np.linspace(-1, 1, num_bins + 1)[:-1]
++    return torch.from_numpy(np.digitize(state.detach().cpu().numpy(), bins=edges) - 1).to(torch.long)
+diff --git a/mstar/model/pi05/components/tokenization.py b/mstar/model/pi05/components/tokenization.py
+index bac5a0152..f73e3cf85 100644
+--- a/mstar/model/pi05/components/tokenization.py
++++ b/mstar/model/pi05/components/tokenization.py
+@@ -1,26 +1,16 @@
+-"""Tokenization wrapper for Pi0.5: PaliGemma tokenizer + state discretization."""
+-
+-import logging
++"""Tokenization wrapper for Pi0.5: the PaliGemma tokenizer."""
+ 
+ import torch
+ 
+ from mstar.model.pi05.config import Pi05Config
+ 
+-logger = logging.getLogger(__name__)
+-
+-
+-def normalize_prompt(prompt: str) -> str:
+-    """Lowercase + strip whitespace, matching openpi's PaligemmaTokenizer."""
+-    return prompt.strip().lower()
+-
+ 
+ class Pi05Tokenizer:
+-    """Wrapper around the HF PaliGemma tokenizer that also tokenizes robot state.
++    """Wrapper around the HF PaliGemma tokenizer.
+ 
+-    Robot state values are discretized into ``state_token_bins`` bins and mapped
+-    to language token IDs starting at ``state_token_offset``. Pi0.5 reuses
+-    bottom-of-vocab tokens for state bins so that PaliGemma's embedding table
+-    can embed them directly.
++    The prompt is encoded as given, with a leading BOS and no other
++    normalization, as openpi's pi05 ``PaligemmaTokenizer.tokenize`` does; the
++    robot state is already part of it (see ``Pi05Model.process_prompt``).
+     """
+ 
+     def __init__(self, hf_tokenizer, config: Pi05Config):
+@@ -28,8 +18,6 @@ class Pi05Tokenizer:
+         self.config = config
+ 
+     def encode_prompt(self, prompt: str) -> torch.Tensor:
+-        text = normalize_prompt(prompt)
+-        ids = self.hf_tokenizer(text, add_special_tokens=True).input_ids
++        ids = self.hf_tokenizer(prompt, add_special_tokens=True).input_ids
+         ids = ids[: self.config.max_lang_tokens]
+         return torch.tensor(ids, dtype=torch.long)
+-
+diff --git a/mstar/model/pi05/pi05_model.py b/mstar/model/pi05/pi05_model.py
+index 0725eb325..f30b055f2 100644
+--- a/mstar/model/pi05/pi05_model.py
++++ b/mstar/model/pi05/pi05_model.py
+@@ -492,17 +492,14 @@ class Pi05Model(Model):
+     ) -> NameToTensorList | ProcessPromptOutput:
+         """Tokenize the Pi0.5 prompt + robot state into a single token stream.
+ 
+-        Pi0.5's production preprocessor (lerobot's
+-        ``Pi05PrepareStateTokenizerProcessorStep``) builds a prompt of the
+-        form::
++        The prompt is built as openpi's pi05 ``PaligemmaTokenizer.tokenize``
++        builds it::
+ 
+             "Task: <text>, State: <bin0> <bin1> ... <bin31>;\\nAction: "
+ 
+-        where each ``<bin_i>`` is the integer index (0–255) obtained by
+-        digitizing the normalized state into 256 bins. The PaliGemma
+-        tokenizer then encodes the whole string. We mirror that exactly
+-        here so the resulting ``text_inputs`` stream matches the production
+-        format.
++        where each ``<bin_i>`` is the state's bin index from
++        :func:`discretize_state`, and the PaliGemma tokenizer encodes the
++        whole string with a leading BOS.
+         """
+         if self.tokenizer is None:
+             # Tokenizer-less fallback for dummy mode (skip_weight_loading), used by structural unit tests.
+diff --git a/mstar/model/pi05/submodules.py b/mstar/model/pi05/submodules.py
+index 7e4cf782f..6b8846258 100644
+--- a/mstar/model/pi05/submodules.py
++++ b/mstar/model/pi05/submodules.py
+@@ -79,11 +79,11 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
+         """Resize one request's stack of camera images with aspect-preserving
+         letterbox padding.
+ 
+-        Matches openpi's ``image_tools.resize_with_pad_torch`` exactly:
+-        the longer dimension is scaled to the target size, the shorter
+-        dimension is scaled proportionally, and the result is padded with
+-        ``-1`` (the float32 normalized "black" value) to reach the target
+-        resolution.
++        As openpi's ``image_tools.resize_with_pad``: the longer dimension is
++        scaled to the target size, the shorter one proportionally, and the
++        result is padded with ``-1`` (black once normalized). Its linear
++        resize (``jax.image.resize``) antialiases when downscaling, so this
++        one does too.
+ 
+         Accepted input encodings (auto-detected by dtype + value range):
+           * ``uint8`` in ``[0, 255]`` — what ``Pi05Model.load_image`` hands over
+@@ -121,7 +121,7 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
+         resized_h = int(cur_h / ratio)
+         resized_w = int(cur_w / ratio)
+         resized = nn.functional.interpolate(
+-            images, size=(resized_h, resized_w), mode="bilinear", align_corners=False
++            images, size=(resized_h, resized_w), mode="bilinear", align_corners=False, antialias=True,
+         ).clamp(-1.0, 1.0)
+ 
+         # Symmetric pad with -1.0 (float32 "black" in the [-1, 1] convention).

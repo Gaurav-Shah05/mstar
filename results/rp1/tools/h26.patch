@@ -1,0 +1,374 @@
+diff --git a/configs/pi05.yaml b/configs/pi05.yaml
+index 68dd60130..a4189e25b 100644
+--- a/configs/pi05.yaml
++++ b/configs/pi05.yaml
+@@ -9,6 +9,11 @@ resources:
+   attn:
+     flashinfer_backend: fa2
+ 
++# The action step shares its KV and position state with the prefix step it follows.
++# Pre-planning it gives wrong actions (gate max 0.13 vs 0.02).
++knobs:
++  pre_plan: false
++
+ node_groups:
+   - node_names:
+       - vit_encoder
+@@ -17,5 +22,6 @@ node_groups:
+ 
+   - node_names:
+       - LLM
++      - action_expert
+     ranks:
+       - 0
+diff --git a/configs/pi05_droid.yaml b/configs/pi05_droid.yaml
+index 8ecbc611e..0e43e4748 100644
+--- a/configs/pi05_droid.yaml
++++ b/configs/pi05_droid.yaml
+@@ -32,6 +32,11 @@ resources:
+   attn:
+     flashinfer_backend: fa2
+ 
++# The action step shares its KV and position state with the prefix step it follows.
++# Pre-planning it gives wrong actions (gate max 0.13 vs 0.02).
++knobs:
++  pre_plan: false
++
+ node_groups:
+   - node_names:
+       - vit_encoder
+@@ -40,5 +45,6 @@ node_groups:
+ 
+   - node_names:
+       - LLM
++      - action_expert
+     ranks:
+       - 0
+diff --git a/mstar/model/pi05/config.py b/mstar/model/pi05/config.py
+index 1afc00d2e..44350211b 100644
+--- a/mstar/model/pi05/config.py
++++ b/mstar/model/pi05/config.py
+@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
+ LLM_KV = "kv"
+ LLM_ATTN = "attn"
+ LLM_POS = "rope"
++# The prefix expert and the action expert read and write one KV cache.
++LLM_NODES = ("LLM", "action_expert")
+ 
+ 
+ @dataclass
+diff --git a/mstar/model/pi05/pi05_model.py b/mstar/model/pi05/pi05_model.py
+index 379d6d9ae..c2a38a1b7 100644
+--- a/mstar/model/pi05/pi05_model.py
++++ b/mstar/model/pi05/pi05_model.py
+@@ -70,11 +70,12 @@ from mstar.model.pi05.components.tokenization import Pi05Tokenizer
+ from mstar.model.pi05.config import (
+     LLM_ATTN,
+     LLM_KV,
++    LLM_NODES,
+     LLM_POS,
+     Pi05Config,
+     load_pi05_config,
+ )
+-from mstar.model.pi05.submodules import Pi05LLMSubmodule, Pi05ViTEncoderSubmodule
++from mstar.model.pi05.submodules import Pi05ActionSubmodule, Pi05LLMSubmodule, Pi05ViTEncoderSubmodule
+ from mstar.model.submodule_base import NodeSubmodule
+ 
+ logger = logging.getLogger(__name__)
+@@ -153,7 +154,6 @@ class Pi05Model(Model):
+     PREPROCESS_PARALLEL_IMAGES = True
+ 
+     PREFILL_WALK = "prefill"
+-    ACTION_GEN_WALK = "action_gen"
+ 
+     def __init__(
+         self,
+@@ -429,13 +429,13 @@ class Pi05Model(Model):
+             num_qo_heads=self.config.num_qo_heads,
+         )
+         return [
+-            KVSpec(resource_key=LLM_KV, nodes={"LLM"}, config=kv_config),
++            KVSpec(resource_key=LLM_KV, nodes=set(LLM_NODES), config=kv_config, leader="LLM"),
+             AttentionSpec(
+-                resource_key=LLM_ATTN, nodes={"LLM"},
++                resource_key=LLM_ATTN, nodes=set(LLM_NODES),
+                 config=AttentionConfig(kv_cache=LLM_KV),
+             ),
+             PositionSpec(
+-                resource_key=LLM_POS, nodes={"LLM"},
++                resource_key=LLM_POS, nodes=set(LLM_NODES),
+                 config=PositionConfig(kv_cache=LLM_KV),
+             ),
+         ]
+@@ -447,7 +447,10 @@ class Pi05Model(Model):
+         # tokenizer. So the model only ever sees a single "text_inputs"
+         # stream — there are no separate state-bin tokens. This matches
+         # lerobot's processor_pi05.Pi05PrepareStateTokenizerProcessorStep.
+-        prefill = Sequential(
++        # One walk, so the action step follows the prefix KV write on the worker
++        # with no round trip through the conductor. ``prefix_done`` only orders
++        # the two: the action step reads the prefix through the shared KV.
++        chunk = Sequential(
+             [
+                 GraphNode(
+                     name="vit_encoder",
+@@ -457,30 +460,24 @@ class Pi05Model(Model):
+                 GraphNode(
+                     name="LLM",
+                     input_names=["img_emb", "text_inputs"],
+-                    outputs=[],
++                    outputs=[GraphEdge(next_node="action_expert", name="prefix_done")],
+                 ),
+-            ]
+-        )
+-
+-        # All num_flow_steps Euler steps run inside one LLM step: the prefix KV
+-        # and the action tokens' positions are the same for every step, so one
+-        # plan serves the whole loop, and a worker step per Euler step would
+-        # cost more host time than the step's GPU work.
+-        action_gen = GraphNode(
+-            name="LLM",
+-            input_names=["noisy_actions"],
+-            outputs=[
+-                GraphEdge(
+-                    next_node=EMIT_TO_CLIENT,
+-                    name="actions",
+-                    output_modality="action",
++                GraphNode(
++                    name="action_expert",
++                    input_names=["prefix_done"],
++                    outputs=[
++                        GraphEdge(
++                            next_node=EMIT_TO_CLIENT,
++                            name="actions",
++                            output_modality="action",
++                        ),
++                    ],
+                 ),
+-            ],
++            ]
+         )
+ 
+         return {
+-            self.PREFILL_WALK: prefill,
+-            self.ACTION_GEN_WALK: action_gen,
++            self.PREFILL_WALK: chunk,
+         }
+ 
+     # ------------------------------------------------------------------
+@@ -615,25 +612,11 @@ class Pi05Model(Model):
+         persist_signals: dict[str, list[TensorPointerInfo]],
+         incoming_connections: list[StreamingConnectionState] | None = None,
+     ) -> ForwardPassArgs:
+-        metadata = partition_metadata
+-        request_done = False
+-        inputs: list[GraphEdge] = []
+-
+-        if metadata.graph_walk == self.PREFILL_WALK:
+-            metadata.is_prefill = False
+-            metadata.graph_walk = self.ACTION_GEN_WALK
+-            # The initial noise is drawn in the LLM submodule's prepare_inputs.
+-            inputs = [GraphEdge(next_node="LLM", name="noisy_actions")]
+-        elif metadata.graph_walk == self.ACTION_GEN_WALK:
+-            request_done = True
+-
+-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
+         return ForwardPassArgs(
+-            full_metadata=metadata,
+-            inputs=inputs,
+-            unpersist_tensors=unpersist_tensors,
+-            step_metadata={"is_prefill": metadata.is_prefill},
+-            request_done=request_done,
++            full_metadata=partition_metadata,
++            inputs=[],
++            unpersist_tensors=[],
++            request_done=True,
+         )
+ 
+     # ------------------------------------------------------------------
+@@ -676,6 +659,17 @@ class Pi05Model(Model):
+             return Pi05LLMSubmodule(
+                 embed_tokens=self.embed_tokens,
+                 paligemma=self.paligemma,
++                action_expert=None,
++                action_in_proj=None,
++                action_out_proj=None,
++                time_mlp=None,
++                config=self.config,
++            )
++        if node_name == "action_expert":
++            self._init_llm_components(device)
++            return Pi05ActionSubmodule(
++                embed_tokens=None,
++                paligemma=None,
+                 action_expert=self.action_expert,
+                 action_in_proj=self.action_in_proj,
+                 action_out_proj=self.action_out_proj,
+diff --git a/mstar/model/pi05/submodules.py b/mstar/model/pi05/submodules.py
+index 1dafdd9a9..81a875aae 100644
+--- a/mstar/model/pi05/submodules.py
++++ b/mstar/model/pi05/submodules.py
+@@ -251,6 +251,8 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
+ 
+ 
+ class Pi05LLMSubmodule(ARNodeSubmodule):
++    STAGE = "prefill"
++
+     """Combined PaliGemma prefix expert + action expert.
+ 
+     Dispatches by graph_walk:
+@@ -356,22 +358,6 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+     ) -> list[AcceleratorGraphConfig]:
+         del tp_world_size
+         return [
+-            # Action generation always has latents of the same size, so it is a
+-            # similar paradigm to AR decode and can use the batched cuda graphs.
+-            BatchedAcceleratorGraphConfig(
+-                # max-autotune until the default compile level (mstar serve -O) is measured on this model
+-                compile_mode="max-autotune-no-cudagraphs",
+-                capture_graph_walk="action_gen",
+-                single_request_inputs=ARNodeInputs(
+-                    input_seq_len=self.config.action_horizon,
+-                    tensor_inputs={
+-                        "noisy_actions": torch.zeros(
+-                            self.config.action_horizon, self.config.action_dim, device=device
+-                        ),
+-                    }
+-                ),
+-                capture_batch_sizes=self.ACTION_GEN_CAPTURE_BATCH_SIZES
+-            ),
+             PackedAcceleratorGraphConfig(
+                 # max-autotune until the default compile level (mstar serve -O) is measured on this model
+                 compile_mode="max-autotune-no-cudagraphs",
+@@ -395,13 +381,9 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         inputs: NameToTensorList,
+         **kwargs
+     ) -> ARNodeInputs:
+-        if graph_walk == "prefill":
+-            return self._prepare_inputs_prefill(
+-                inputs=inputs,
+-            )
+-        if graph_walk == "action_gen":
+-            return self._prepare_inputs_action_gen(fwd_info=fwd_info)
+-        raise ValueError(f"Unknown Pi0.5 LLM graph walk: {graph_walk!r}")
++        if self.STAGE == "prefill":
++            return self._prepare_inputs_prefill(inputs=inputs)
++        return self._prepare_inputs_action_gen(fwd_info=fwd_info)
+ 
+     def _prepare_inputs_prefill(
+         self,
+@@ -449,7 +431,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         stored length nor the position counter advances, so all denoise
+         iterations reuse the same prefix and the same action positions.
+         """
+-        is_prefill = graph_walk == "prefill"
++        is_prefill = self.STAGE == "prefill"
+         segments = [
+             Segment(request_id=rid, label="main", span=inp.input_seq_len)
+             for rid, inp in zip(request_ids, inputs, strict=True)
+@@ -474,11 +456,9 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         inputs: list[ARNodeInputs],
+     ) -> dict[str, torch.Tensor | Any]:
+         del engine_inputs
+-        if graph_walk == "prefill":
++        if self.STAGE == "prefill":
+             return self._preprocess_prefill(inputs=inputs)
+-        if graph_walk == "action_gen":
+-            return self._preprocess_action_gen(inputs=inputs)
+-        raise ValueError(f"Unknown Pi0.5 LLM graph walk: {graph_walk!r}")
++        return self._preprocess_action_gen(inputs=inputs)
+ 
+     def _preprocess_prefill(
+         self,
+@@ -512,11 +492,9 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         **kwargs # coming from preprocess output
+     ) -> NameToTensorList:
+         del engine_inputs
+-        if graph_walk == "prefill":
++        if self.STAGE == "prefill":
+             return self._forward_prefill(**kwargs)
+-        if graph_walk == "action_gen":
+-            return self._forward_action_gen(**kwargs)
+-        raise ValueError(f"Unknown Pi0.5 LLM graph walk: {graph_walk!r}")
++        return self._forward_action_gen(**kwargs)
+ 
+     def forward_batched(
+         self,
+@@ -529,18 +507,15 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         ``preprocess`` already concatenated the per-request tensors; the runner
+         planned attention/RoPE from this walk's ``declare_step``.
+         """
+-        if graph_walk == "prefill":
++        if self.STAGE == "prefill":
+             return self._forward_prefill_batched(
+                 request_ids=engine_inputs.request_ids,
+                 **kwargs,
+             )
+-        if graph_walk == "action_gen":
+-            return self._forward_action_gen_batched(
+-                request_ids=engine_inputs.request_ids,
+-                **kwargs,
+-            )
+-        raise ValueError(f"Batched forward not supported for graph walk: {graph_walk!r}")
+-
++        return self._forward_action_gen_batched(
++            request_ids=engine_inputs.request_ids,
++            **kwargs,
++        )
+ 
+     def _forward_prefill_batched(
+         self,
+@@ -550,8 +525,8 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+     ) -> dict[str, NameToTensorList]:
+         """Batched prefill: single PaliGemma forward over concatenated prefixes."""
+         self.paligemma(query_sequence=prefix_embs, label="main")
+-        # Prefill produces no graph-edge outputs.
+-        return {rid: {} for rid in request_ids}
++        done = prefix_embs.new_zeros(len(request_ids))
++        return {rid: {"prefix_done": [done[i:i + 1]]} for i, rid in enumerate(request_ids)}
+ 
+     def _forward_action_gen_batched(
+         self,
+@@ -574,7 +549,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+         **kwargs,
+     ) -> NameToTensorList:
+         self.paligemma(query_sequence=prefix_embs, label="main")
+-        return {}
++        return {"prefix_done": [prefix_embs.new_zeros(1)]}
+ 
+     def _forward_action_gen(
+         self,
+@@ -623,3 +598,33 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
+             )
+             actions = euler_step(actions, self.action_out_proj(suffix_out), dt)
+         return actions
++
++
++class Pi05ActionSubmodule(Pi05LLMSubmodule):
++    """The action expert's node: reads the prefix KV the LLM node committed and
++    runs the whole Euler loop in one step."""
++
++    STAGE = "action_gen"
++
++    def get_accelerator_graph_configs(
++        self, device: torch.device, tp_world_size: int = 1,
++    ) -> list[AcceleratorGraphConfig]:
++        del tp_world_size
++        return [
++            # Action generation always has latents of the same size, so it is a
++            # similar paradigm to AR decode and can use the batched cuda graphs.
++            BatchedAcceleratorGraphConfig(
++                # max-autotune until the default compile level (mstar serve -O) is measured on this model
++                compile_mode="max-autotune-no-cudagraphs",
++                capture_graph_walk="prefill",
++                single_request_inputs=ARNodeInputs(
++                    input_seq_len=self.config.action_horizon,
++                    tensor_inputs={
++                        "noisy_actions": torch.zeros(
++                            self.config.action_horizon, self.config.action_dim, device=device
++                        ),
++                    }
++                ),
++                capture_batch_sizes=self.ACTION_GEN_CAPTURE_BATCH_SIZES
++            ),
++        ]
