@@ -795,10 +795,20 @@ class TestCutToBucket:
         cut_to_bucket(take, {1}, self.CUT)
         assert take == {1: 1024}
 
-    def test_decode_rows_count_and_only_the_prompt_is_cut(self):
+    def test_a_step_with_decode_rows_stays_whole(self):
         take = {1: 1034, 2: 1, 3: 1}
+        cut_to_bucket(take, {1}, self.CUT)
+        assert take == {1: 1034, 2: 1, 3: 1}
+
+    def test_a_chain_of_decode_rows_stays_whole(self):
+        take = {1: 1034}
         cut_to_bucket(take, {1}, self.CUT, chain_tokens=13)
-        assert take == {1: 1009, 2: 1, 3: 1}
+        assert take == {1: 1034}
+
+    def test_the_longest_of_several_prompts_is_cut(self):
+        take = {1: 700, 2: 334}
+        cut_to_bucket(take, {1, 2}, self.CUT)
+        assert take == {1: 690, 2: 334}
 
     def test_a_step_on_a_bucket_stays(self):
         take = {1: 1024}
@@ -828,9 +838,9 @@ class TestCutToBucket:
         assert take == {1: 4000}
 
     def test_the_cut_row_keeps_the_floor(self):
-        take = {1: 1030, 2: 12}
-        cut_to_bucket(take, {2}, self.CUT, min_chunk=8)
-        assert take == {1: 1030, 2: 12}
+        take = {1: 530, 2: 520}
+        cut_to_bucket(take, {1, 2}, self.CUT, min_chunk=520)
+        assert take == {1: 530, 2: 520}
 
 
 def test_captured_token_counts_read_the_walks_buckets():

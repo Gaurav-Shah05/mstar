@@ -20,7 +20,7 @@ sys.path.insert(0, ".")
 
 import pytest
 
-from mstar.engine.chunking import ChunkingManagement, ChunkRange
+from mstar.engine.chunking import BucketCut, ChunkingManagement, ChunkRange
 from mstar.engine.resources.step import (
     FULL_ADMIT_NOT_READY,
     FULL_ADMIT_OK,
@@ -1628,6 +1628,22 @@ def test_returned_rows_go_back_to_their_ready_queue_not_the_backlog():
 
     assert not sched.backlog
     assert set(manager.queues["wg0"].get_ready_node_names()) == {"r1", "r3"}
+
+
+@pytest.mark.parametrize("chain_tokens, cut", [(0, {"r": 1024}), (13, {})])
+def test_the_builder_cuts_at_a_bucket_only_with_no_chain_beside_the_row(chain_tokens, cut):
+    builder = FIFOBatchBuilder()
+    result = builder.build_batch(BatchBuildRequest(
+        node_name=NODE, graph_walk=WALK,
+        fresh=_batch(["r"]),
+        pick=builder.pick(StepCandidates(graph_walk=WALK, queued=["r"])),
+        max_batch_tokens=2048,
+        row_tokens={"r": 1034},
+        chunkable={"r"},
+        bucket_cut=BucketCut((32, 1024, 2048), 512),
+        chain_tokens=chain_tokens,
+    ))
+    assert result.chunk_tokens == cut
 
 
 def test_fifo_puts_the_backlog_ahead_of_fresh_rows():
