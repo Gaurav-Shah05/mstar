@@ -251,6 +251,8 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
 
 
 class Pi05LLMSubmodule(ARNodeSubmodule):
+    STAGE = "prefill"
+
     """Combined PaliGemma prefix expert + action expert.
 
     Dispatches by graph_walk:
@@ -274,8 +276,6 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         "time_mlp.",  # the adaRMS condition
     )
 
-    # For the default image size and a simple text prompt, one request is about 400 tokens
-    PREFILL_TOKEN_BUCKETS = [512, 1024, 1800] # 2048 was giving OOM
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
     ACTION_GEN_CAPTURE_BATCH_SIZES = [1, 2, 4]
 
@@ -351,27 +351,18 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         emb = self.embed_tokens(ids)
         return emb * self._text_embed_scale
 
+    def _prefill_token_buckets(self) -> list[int]:
+        """Whole requests' longest prefixes, so a step that fits runs captured: an
+        eager prefill costs tens of ms of host time, a replay under 1 ms."""
+        cfg = self.config
+        longest = cfg.num_cameras * cfg.tokens_per_image + cfg.max_lang_tokens
+        return sorted({512, *(n * longest for n in (1, 2, 4))})
+
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[AcceleratorGraphConfig]:
         del tp_world_size
         return [
-            # Action generation always has latents of the same size, so it is a
-            # similar paradigm to AR decode and can use the batched cuda graphs.
-            BatchedAcceleratorGraphConfig(
-                # max-autotune until the default compile level (mstar serve -O) is measured on this model
-                compile_mode="max-autotune-no-cudagraphs",
-                capture_graph_walk="action_gen",
-                single_request_inputs=ARNodeInputs(
-                    input_seq_len=self.config.action_horizon,
-                    tensor_inputs={
-                        "noisy_actions": torch.zeros(
-                            self.config.action_horizon, self.config.action_dim, device=device
-                        ),
-                    }
-                ),
-                capture_batch_sizes=self.ACTION_GEN_CAPTURE_BATCH_SIZES
-            ),
             PackedAcceleratorGraphConfig(
                 # max-autotune until the default compile level (mstar serve -O) is measured on this model
                 compile_mode="max-autotune-no-cudagraphs",
@@ -382,7 +373,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
                         n, self.config.hidden_size, device=device, dtype=torch.float32
                     ),
                 ),
-                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
+                capture_token_lengths=self._prefill_token_buckets(),
                 capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
                 compile=True,
             ),
@@ -395,13 +386,9 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         inputs: NameToTensorList,
         **kwargs
     ) -> ARNodeInputs:
-        if graph_walk == "prefill":
-            return self._prepare_inputs_prefill(
-                inputs=inputs,
-            )
-        if graph_walk == "action_gen":
-            return self._prepare_inputs_action_gen(fwd_info=fwd_info)
-        raise ValueError(f"Unknown Pi0.5 LLM graph walk: {graph_walk!r}")
+        if self.STAGE == "prefill":
+            return self._prepare_inputs_prefill(inputs=inputs)
+        return self._prepare_inputs_action_gen(fwd_info=fwd_info)
 
     def _prepare_inputs_prefill(
         self,
@@ -449,7 +436,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         stored length nor the position counter advances, so all denoise
         iterations reuse the same prefix and the same action positions.
         """
-        is_prefill = graph_walk == "prefill"
+        is_prefill = self.STAGE == "prefill"
         segments = [
             Segment(request_id=rid, label="main", span=inp.input_seq_len)
             for rid, inp in zip(request_ids, inputs, strict=True)
@@ -474,11 +461,9 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
         del engine_inputs
-        if graph_walk == "prefill":
+        if self.STAGE == "prefill":
             return self._preprocess_prefill(inputs=inputs)
-        if graph_walk == "action_gen":
-            return self._preprocess_action_gen(inputs=inputs)
-        raise ValueError(f"Unknown Pi0.5 LLM graph walk: {graph_walk!r}")
+        return self._preprocess_action_gen(inputs=inputs)
 
     def _preprocess_prefill(
         self,
@@ -512,11 +497,9 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         **kwargs # coming from preprocess output
     ) -> NameToTensorList:
         del engine_inputs
-        if graph_walk == "prefill":
+        if self.STAGE == "prefill":
             return self._forward_prefill(**kwargs)
-        if graph_walk == "action_gen":
-            return self._forward_action_gen(**kwargs)
-        raise ValueError(f"Unknown Pi0.5 LLM graph walk: {graph_walk!r}")
+        return self._forward_action_gen(**kwargs)
 
     def forward_batched(
         self,
@@ -529,18 +512,15 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         ``preprocess`` already concatenated the per-request tensors; the runner
         planned attention/RoPE from this walk's ``declare_step``.
         """
-        if graph_walk == "prefill":
+        if self.STAGE == "prefill":
             return self._forward_prefill_batched(
                 request_ids=engine_inputs.request_ids,
                 **kwargs,
             )
-        if graph_walk == "action_gen":
-            return self._forward_action_gen_batched(
-                request_ids=engine_inputs.request_ids,
-                **kwargs,
-            )
-        raise ValueError(f"Batched forward not supported for graph walk: {graph_walk!r}")
-
+        return self._forward_action_gen_batched(
+            request_ids=engine_inputs.request_ids,
+            **kwargs,
+        )
 
     def _forward_prefill_batched(
         self,
@@ -550,8 +530,8 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
     ) -> dict[str, NameToTensorList]:
         """Batched prefill: single PaliGemma forward over concatenated prefixes."""
         self.paligemma(query_sequence=prefix_embs, label="main")
-        # Prefill produces no graph-edge outputs.
-        return {rid: {} for rid in request_ids}
+        done = prefix_embs.new_zeros(len(request_ids))
+        return {rid: {"prefix_done": [done[i:i + 1]]} for i, rid in enumerate(request_ids)}
 
     def _forward_action_gen_batched(
         self,
@@ -574,7 +554,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         **kwargs,
     ) -> NameToTensorList:
         self.paligemma(query_sequence=prefix_embs, label="main")
-        return {}
+        return {"prefix_done": [prefix_embs.new_zeros(1)]}
 
     def _forward_action_gen(
         self,
@@ -623,3 +603,33 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
             )
             actions = euler_step(actions, self.action_out_proj(suffix_out), dt)
         return actions
+
+
+class Pi05ActionSubmodule(Pi05LLMSubmodule):
+    """The action expert's node: reads the prefix KV the LLM node committed and
+    runs the whole Euler loop in one step."""
+
+    STAGE = "action_gen"
+
+    def get_accelerator_graph_configs(
+        self, device: torch.device, tp_world_size: int = 1,
+    ) -> list[AcceleratorGraphConfig]:
+        del tp_world_size
+        return [
+            # Action generation always has latents of the same size, so it is a
+            # similar paradigm to AR decode and can use the batched cuda graphs.
+            BatchedAcceleratorGraphConfig(
+                # max-autotune until the default compile level (mstar serve -O) is measured on this model
+                compile_mode="max-autotune-no-cudagraphs",
+                capture_graph_walk="prefill",
+                single_request_inputs=ARNodeInputs(
+                    input_seq_len=self.config.action_horizon,
+                    tensor_inputs={
+                        "noisy_actions": torch.zeros(
+                            self.config.action_horizon, self.config.action_dim, device=device
+                        ),
+                    }
+                ),
+                capture_batch_sizes=self.ACTION_GEN_CAPTURE_BATCH_SIZES
+            ),
+        ]

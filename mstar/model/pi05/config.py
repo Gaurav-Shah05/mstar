@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 LLM_KV = "kv"
 LLM_ATTN = "attn"
 LLM_POS = "rope"
+# The prefix expert and the action expert read and write one KV cache.
+LLM_NODES = ("LLM", "action_expert")
 
 
 @dataclass

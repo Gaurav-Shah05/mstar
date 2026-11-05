@@ -70,11 +70,12 @@ from mstar.model.pi05.components.tokenization import Pi05Tokenizer
 from mstar.model.pi05.config import (
     LLM_ATTN,
     LLM_KV,
+    LLM_NODES,
     LLM_POS,
     Pi05Config,
     load_pi05_config,
 )
-from mstar.model.pi05.submodules import Pi05LLMSubmodule, Pi05ViTEncoderSubmodule
+from mstar.model.pi05.submodules import Pi05ActionSubmodule, Pi05LLMSubmodule, Pi05ViTEncoderSubmodule
 from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
@@ -153,7 +154,6 @@ class Pi05Model(Model):
     PREPROCESS_PARALLEL_IMAGES = True
 
     PREFILL_WALK = "prefill"
-    ACTION_GEN_WALK = "action_gen"
 
     def __init__(
         self,
@@ -429,13 +429,13 @@ class Pi05Model(Model):
             num_qo_heads=self.config.num_qo_heads,
         )
         return [
-            KVSpec(resource_key=LLM_KV, nodes={"LLM"}, config=kv_config),
+            KVSpec(resource_key=LLM_KV, nodes=set(LLM_NODES), config=kv_config, leader="LLM"),
             AttentionSpec(
-                resource_key=LLM_ATTN, nodes={"LLM"},
+                resource_key=LLM_ATTN, nodes=set(LLM_NODES),
                 config=AttentionConfig(kv_cache=LLM_KV),
             ),
             PositionSpec(
-                resource_key=LLM_POS, nodes={"LLM"},
+                resource_key=LLM_POS, nodes=set(LLM_NODES),
                 config=PositionConfig(kv_cache=LLM_KV),
             ),
         ]
@@ -447,7 +447,10 @@ class Pi05Model(Model):
         # tokenizer. So the model only ever sees a single "text_inputs"
         # stream — there are no separate state-bin tokens. This matches
         # lerobot's processor_pi05.Pi05PrepareStateTokenizerProcessorStep.
-        prefill = Sequential(
+        # One walk, so the action step follows the prefix KV write on the worker
+        # with no round trip through the conductor. ``prefix_done`` only orders
+        # the two: the action step reads the prefix through the shared KV.
+        chunk = Sequential(
             [
                 GraphNode(
                     name="vit_encoder",
@@ -457,30 +460,24 @@ class Pi05Model(Model):
                 GraphNode(
                     name="LLM",
                     input_names=["img_emb", "text_inputs"],
-                    outputs=[],
+                    outputs=[GraphEdge(next_node="action_expert", name="prefix_done")],
+                ),
+                GraphNode(
+                    name="action_expert",
+                    input_names=["prefix_done"],
+                    outputs=[
+                        GraphEdge(
+                            next_node=EMIT_TO_CLIENT,
+                            name="actions",
+                            output_modality="action",
+                        ),
+                    ],
                 ),
             ]
         )
 
-        # All num_flow_steps Euler steps run inside one LLM step: the prefix KV
-        # and the action tokens' positions are the same for every step, so one
-        # plan serves the whole loop, and a worker step per Euler step would
-        # cost more host time than the step's GPU work.
-        action_gen = GraphNode(
-            name="LLM",
-            input_names=["noisy_actions"],
-            outputs=[
-                GraphEdge(
-                    next_node=EMIT_TO_CLIENT,
-                    name="actions",
-                    output_modality="action",
-                ),
-            ],
-        )
-
         return {
-            self.PREFILL_WALK: prefill,
-            self.ACTION_GEN_WALK: action_gen,
+            self.PREFILL_WALK: chunk,
         }
 
     # ------------------------------------------------------------------
@@ -615,25 +612,11 @@ class Pi05Model(Model):
         persist_signals: dict[str, list[TensorPointerInfo]],
         incoming_connections: list[StreamingConnectionState] | None = None,
     ) -> ForwardPassArgs:
-        metadata = partition_metadata
-        request_done = False
-        inputs: list[GraphEdge] = []
-
-        if metadata.graph_walk == self.PREFILL_WALK:
-            metadata.is_prefill = False
-            metadata.graph_walk = self.ACTION_GEN_WALK
-            # The initial noise is drawn in the LLM submodule's prepare_inputs.
-            inputs = [GraphEdge(next_node="LLM", name="noisy_actions")]
-        elif metadata.graph_walk == self.ACTION_GEN_WALK:
-            request_done = True
-
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
         return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": metadata.is_prefill},
-            request_done=request_done,
+            full_metadata=partition_metadata,
+            inputs=[],
+            unpersist_tensors=[],
+            request_done=True,
         )
 
     # ------------------------------------------------------------------
@@ -676,6 +659,17 @@ class Pi05Model(Model):
             return Pi05LLMSubmodule(
                 embed_tokens=self.embed_tokens,
                 paligemma=self.paligemma,
+                action_expert=None,
+                action_in_proj=None,
+                action_out_proj=None,
+                time_mlp=None,
+                config=self.config,
+            )
+        if node_name == "action_expert":
+            self._init_llm_components(device)
+            return Pi05ActionSubmodule(
+                embed_tokens=None,
+                paligemma=None,
                 action_expert=self.action_expert,
                 action_in_proj=self.action_in_proj,
                 action_out_proj=self.action_out_proj,
