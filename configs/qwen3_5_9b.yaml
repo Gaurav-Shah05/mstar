@@ -9,6 +9,9 @@ model_kwargs:
   # A step of chunkable prompts alone, just past a bucket, cuts at it when that avoids this
   # much padding (docs/models.rst)
   bucket_cut_min_saved: 512
+# Lowers TTFT on the host it was measured on (docs/models.rst, mstar/utils/knobs.py)
+knobs:
+  step_thread_util_min: 1024
 node_groups:
   # Text, images and video. Colocated: the
   # encoder runs once per request, then idles.

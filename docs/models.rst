@@ -430,6 +430,13 @@ default, which lowers the token count of short clips. Notes:
   5880 (one 6890 round; the other two about 5375); ShareGPT at c=64 11360 to 11686. Under
   the config's default ``step_thread_core: auto``, which pins nothing here, it is
   unmeasured, as is any other governor.
+- ``configs/qwen3_5_9b.yaml`` sets it too. Same host and settings, no prompt or image
+  shared between cells: TTFT p50 goes from 58.5 to 55.6 ms on Random 1024/256 at c=1,
+  116.7 to 108.8 at c=4 and 258.0 to 254.1 at c=16; ShareGPT 23.2 to 20.2, 28.7 to 22.8,
+  28.3 to 25.7 and 44.0 to 37.8 at c=1, 4, 16 and 64; images 143.1 to 128.0, 167.4 to
+  153.6 and 210.2 to 189.8 at c=1, 4 and 16. Output tok/s moves by under 3%. Random past
+  c=16, ShareGPT past c=64, images past c=16, video and ``step_thread_core: auto`` are
+  unmeasured.
 - The vision encoder attends within each image and each video frame group
   separately, and its captured CUDA graphs hold up to 16384 patches and 64 such
   segments per prompt. A prompt over either limit runs the encoder without the
