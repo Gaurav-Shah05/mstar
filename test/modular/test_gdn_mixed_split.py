@@ -129,7 +129,8 @@ def _reference(device, x, weight, inputs, layout, null_slot=SINK_SLOT):
     return conv_out, out, state, conv
 
 
-def _mixed(device, x, weight, inputs, accelerator_graph, layout, decode_rows=None, null_slot=SINK_SLOT):
+def _mixed(device, x, weight, inputs, accelerator_graph, layout, decode_rows=None, null_slot=SINK_SLOT,
+           stage_inputs=False):
     SPANS, SLOT_IDS, HAS_STATE = _cols(layout)
     state, conv = _pools(device)
     tokens = x.shape[0]
@@ -153,7 +154,7 @@ def _mixed(device, x, weight, inputs, accelerator_graph, layout, decode_rows=Non
         device=device, pad_slot_id=PAD_SLOT_ID, null_slot_id=null_slot,
         num_tokens=bucket_tokens, bs=decode_rows or bucket_bs,
         accelerator_graph=accelerator_graph, max_prefill_rows=MAX_PROMPTS,
-        has_sink_state=null_slot != NO_SLOT,
+        has_sink_state=null_slot != NO_SLOT, stage_inputs=stage_inputs,
     )
     w.plan(spans, tuple(slots), tuple(has))
     conv_out = w.run_conv(x, conv, weight)[:tokens]
@@ -213,6 +214,17 @@ def test_mixed_split_matches_the_chunked_path(null_slot, layout, accelerator_gra
     x, weight, inputs = _step(device, layout)
     ref = _reference(device, x, weight, inputs, layout, null_slot=null_slot)
     mixed = _mixed(device, x, weight, inputs, accelerator_graph, layout, null_slot=null_slot)
+    _check(layout, mixed, ref, null_slot=null_slot)
+
+
+@requires_gpu
+@pytest.mark.parametrize("null_slot,layout,accelerator_graph", list(_split_cases()))
+def test_a_staged_mixed_split_matches_the_chunked_path(null_slot, layout, accelerator_graph):
+    """The one-launch input stage in the chunked half: the same result, on any GPU it applies to."""
+    device = torch.device("cuda")
+    x, weight, inputs = _step(device, layout)
+    ref = _reference(device, x, weight, inputs, layout, null_slot=null_slot)
+    mixed = _mixed(device, x, weight, inputs, accelerator_graph, layout, null_slot=null_slot, stage_inputs=True)
     _check(layout, mixed, ref, null_slot=null_slot)
 
 
