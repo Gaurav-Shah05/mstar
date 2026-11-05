@@ -437,6 +437,14 @@ default, which lowers the token count of short clips. Notes:
   153.6 and 210.2 to 189.8 at c=1, 4 and 16. Output tok/s moves by under 3%. Random past
   c=16, ShareGPT past c=64, images past c=16, video and ``step_thread_core: auto`` are
   unmeasured.
+- ``configs/qwen3_5_4b.yaml`` sets it too, measured the same way: on Random 1024/256 TTFT
+  p50 goes from 56.3 to 51.2 ms at c=1, 220.4 to 194.2 at c=32 and 220.3 to 205.0 at c=64
+  (one 237.6 base round; the other two about 212), with c=4 and c=16 overlapping, and on
+  ShareGPT from 22.4 to 17.9 at c=1 and 40.5 to 34.2 at c=64. Output tok/s rises 0.4-1.0%,
+  and 4.2% on ShareGPT at c=64. ShareGPT at c=4 to 32, c=128, images, video and
+  ``step_thread_core: auto`` are unmeasured. On 2B the result is unresolved: means lean
+  better but every cell overlaps, with up to 19% between rounds of an arm, so
+  ``configs/qwen3_5_2b.yaml`` leaves it off.
 - The vision encoder attends within each image and each video frame group
   separately, and its captured CUDA graphs hold up to 16384 patches and 64 such
   segments per prompt. A prompt over either limit runs the encoder without the

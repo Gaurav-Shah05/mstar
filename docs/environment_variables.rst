@@ -567,7 +567,7 @@ Worker scheduling
        sleep and wake many times a step, read as lightly loaded, and run far
        below the CPU's top frequency (1.0-1.5 GHz under load on a Xeon 8460Y+
        with a 3.7 GHz turbo). Measured at 1024, ``step_thread_core: siblings``,
-       ``--rust-frontend``, Qwen3.5-0.8B on H200: see :doc:`models`. Threads and
+       ``--rust-frontend``, Qwen3.5 on H200: see :doc:`models`. Threads and
        processes they start inherit the floor. No effect under another governor
        or without ``CONFIG_UCLAMP_TASK``; a refused call logs a warning. Read by
        ``knobs.step_thread_util_min``.
