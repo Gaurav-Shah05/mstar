@@ -8,6 +8,7 @@ Base: run-base e8826a777. GPU: 1x H200. Headline: action-chunk latency p50 at c=
 - Side task done: perf/rp1-main at 8adf90628, gated, checkpoint reported; see On main.
 - Not kept, closest candidate: H28, branch perf/rp1-h28 (WIP commit on top of 3444a8779). Not on perf/rp1-pi05 and not on perf/rp1-main.
 - GPU idle, nothing running. /workspace/loop/deadline set to 1793982000.
+- **First round on return: s_h28, H28 under the brief's sequential protocol, full 3 rounds each** (`round_cached.sh`, see the protocol note at the end of this file; arms take about 9 minutes, so it did not fit before the cutoff and was stopped incomplete; no decision from it). If sequential proves right, also consider re-measuring H21, H22, H25, which failed under the paired harness.
 - On return: check /workspace survived; if not, restore from perf/rp1-results (results/rp1/, tools/ holds the harness, ref/ the reference actions) and rebuild the venvs and droid-cache. A new variant of H28 that gains more at c=1 is the next round, since any H28 re-run is only worth it with a real change: per-node bucket padding for the ~930-token prefix, or cutting the 2.3 ms client-side and 0.9 ms worker hops. Then take the c=8 mean: H28 p50 99.5 but mean about 109, so some rows run slow (not diagnosed).
 
 ## On main (status 2026-11-05 00:45 UTC; branch perf/rp1-main at 9c6f1ad75, venv /workspace/venv-main)
