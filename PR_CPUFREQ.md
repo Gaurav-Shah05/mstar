@@ -1,4 +1,4 @@
-IN PROGRESS: review fixes applied; gate, numbers and the full serial test run next
+IN PROGRESS: gate done; 0.8B done, like-for-like uclampset rounds, 9B and the full serial test running
 
 # PR_CPUFREQ facts
 
