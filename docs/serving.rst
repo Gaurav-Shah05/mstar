@@ -396,7 +396,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        ``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
        ``kv_chain_lazy_steps``, ``kv_plan_cache``, ``kv_pinned_indptrs``,
        ``gc_gen0_threshold``, ``pre_plan``, ``step_thread_core``, ``idle_hold``,
-       ``compile_deterministic`` and ``resident_planning`` (``true``/``false`` or an integer;
+       ``full_cpu_frequency``, ``compile_deterministic`` and ``resident_planning``
+       (``true``/``false`` or an integer, ``full_cpu_frequency`` only ``true``/``false``;
        ``step_thread_core`` takes ``auto``, the default, ``off``, ``always``, ``siblings`` or a CPU number,
        ``idle_hold`` ``off``, the default, or ``qos``, see :ref:`host-idle`, and ``resident_planning``
        ``auto``, the default, or ``off``). ``compile_deterministic`` reaches
@@ -780,7 +781,7 @@ times, and every step's tokens go from the API server's message thread to the
 frontend. On a host whose idle cores drop into deep C-states each handoff to a
 sleeping core waits for it to wake, and a core that sleeps between handoffs stays
 at a low clock under the ``powersave`` governor, so a small model's step is mostly
-host time spent waking CPUs. Two knobs deal with it:
+host time spent waking CPUs. Three knobs deal with it:
 
 - ``step_thread_core`` pins those threads. ``always`` gives each worker three cores,
   one hardware thread of each, and the API server a core of its own. ``siblings``
@@ -792,6 +793,9 @@ host time spent waking CPUs. Two knobs deal with it:
   can open (8 cores on a node of four GPUs), ``always`` and ``siblings`` size by the
   GPUs the server was given, and a lock per core keeps servers that share ``/tmp``
   on different cores.
+- ``full_cpu_frequency`` asks for the CPU's top clock on every thread of the deployment
+  while it runs. The ``schedutil`` governor holds these threads at a low clock too, and
+  it is the only governor that reads this request.
 - ``idle_hold: qos`` asks the kernel to keep every CPU out of deep idle states
   through ``/dev/cpu_dma_latency`` for the server's life. It needs a device most
   containers hide, and it logs what it got.
@@ -838,7 +842,8 @@ at high concurrency (c=64 67 → 86 ms) while raising its throughput, and FLUX.2
 at c=1 lost about 12% there (c=8 level). A low-duty model with eager host work can
 leave it ``off``.
 
-Details are in :doc:`environment_variables` under ``MSTAR_STEP_THREAD_CORE``.
+Details are in :doc:`environment_variables` under ``MSTAR_STEP_THREAD_CORE`` and
+``MSTAR_FULL_CPU_FREQUENCY``.
 
 .. _tensor-transport:
 

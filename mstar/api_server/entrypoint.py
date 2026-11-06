@@ -2785,6 +2785,18 @@ async def shutdown_event():
 # CLI entry point
 # ------------------------------------------------------------------
 
+def apply_cpu_settings(config: dict) -> None:
+    """This deployment's CPU plan and frequency request, for before its conductor
+    starts, so that process and all it starts inherit the request."""
+    try:
+        # installs the config's knobs too, which the next line reads
+        cpus.install(deployment_cpu_plan(config))
+        if knobs.full_cpu_frequency_enabled():
+            cpus.run_at_full_frequency()
+    except cpus.CpuPlanError as e:
+        raise SystemExit(f"mstar: {e}") from None
+
+
 def deployment_cpu_plan(config: dict) -> cpus.CpuPlan:
     """The deployment's CPU plan, as each worker builds it from the conductor's
     device list: the config's ``step_thread_core`` and ``deployment_workers``.
@@ -2972,11 +2984,8 @@ def main(argv: list[str] | None = None):
         cache_dir=args.cache_dir,
         **{**model_init_kwargs(model_name), **yaml_model_kwargs},
     )
-    # before any pool thread: the pools are sized from the CPUs it leaves unpinned
-    try:
-        cpus.install(deployment_cpu_plan(config))
-    except cpus.CpuPlanError as e:
-        raise SystemExit(f"mstar: {e}") from None
+    # before any pool thread: the pools are sized from the CPUs the plan leaves unpinned
+    apply_cpu_settings(config)
     if knobs.idle_hold() == "qos":
         logger.info(cpus.hold_idle())
     _set_preprocess_threads(model, config)

@@ -41,10 +41,13 @@ a CPU vendor other than Intel, idle states under ``DEEP_IDLE_US``
 """
 from __future__ import annotations
 
+import ctypes
+import errno
 import fcntl
 import logging
 import math
 import os
+import platform
 import sys
 from collections.abc import Callable, Collection, Iterable, Sequence
 from dataclasses import dataclass, field, replace
@@ -263,7 +266,8 @@ def install(new: CpuPlan | None) -> None:
 
 
 class CpuPlanError(ValueError):
-    """A ``step_thread_core`` value the process mask can't honour."""
+    """A CPU knob's value this host can't honour: a ``step_thread_core`` the
+    process mask doesn't allow, or ``full_cpu_frequency`` where uclamp is refused."""
 
 
 # ── where a GPU sits ────────────────────────────────────────────────────────
@@ -457,6 +461,64 @@ def hold_idle(device: Path = _PM_QOS_DEVICE) -> str:
         return f"idle_hold qos: nothing held, can't write {device}: {e.strerror}"
     _idle_hold_fd = fd
     return f"idle_hold qos: holding {device} at {IDLE_HOLD_US} µs for this server's life"
+
+
+class _SchedAttr(ctypes.Structure):
+    """``struct sched_attr`` through the utilization clamps (``sched_setattr(2)``)."""
+    _fields_ = [
+        ("size", ctypes.c_uint32), ("sched_policy", ctypes.c_uint32), ("sched_flags", ctypes.c_uint64),
+        ("sched_nice", ctypes.c_int32), ("sched_priority", ctypes.c_uint32),
+        ("sched_runtime", ctypes.c_uint64), ("sched_deadline", ctypes.c_uint64), ("sched_period", ctypes.c_uint64),
+        ("sched_util_min", ctypes.c_uint32), ("sched_util_max", ctypes.c_uint32),
+    ]
+
+
+# glibc wraps sched_setattr only from 2.41
+_SCHED_SETATTR = {"x86_64": 314, "aarch64": 274}
+# without these the call also sets the policy and nice from the struct's zeros
+_SCHED_FLAG_KEEP_POLICY_PARAMS = 0x18
+_SCHED_FLAG_UTIL_CLAMP_MIN = 0x20
+_SCHED_CAPACITY_SCALE = 1024
+
+
+def run_at_full_frequency(cpu_root: Path = _CPU_ROOT) -> None:
+    """Set ``uclamp.min`` to the top on every thread of this process, so each
+    runs at full CPU frequency under ``schedutil`` while runnable; idle threads
+    stay asleep. Threads and processes started afterwards inherit it, through
+    ``exec`` too, so call this before starting the deployment's.
+
+    Raises ``CpuPlanError`` where the kernel refuses, so a deployment that asked
+    for this clock never runs slower with only a log line to say so; a governor
+    other than ``schedutil``, the only one that reads the clamp, gets a warning."""
+    number = _SCHED_SETATTR.get(platform.machine()) if sys.platform == "linux" else None
+    if number is None:
+        raise CpuPlanError(
+            "full_cpu_frequency needs sched_setattr, whose number this knows for Linux on x86_64 and aarch64; "
+            f"this is {sys.platform} on {platform.machine()}"
+        )
+    attr = _SchedAttr(
+        size=ctypes.sizeof(_SchedAttr),
+        sched_flags=_SCHED_FLAG_KEEP_POLICY_PARAMS | _SCHED_FLAG_UTIL_CLAMP_MIN,
+        sched_util_min=_SCHED_CAPACITY_SCALE,
+    )
+    libc = ctypes.CDLL(None, use_errno=True)
+    tids = os.listdir("/proc/self/task")
+    for tid in tids:
+        if libc.syscall(number, int(tid), ctypes.byref(attr), 0) != 0 and ctypes.get_errno() != errno.ESRCH:
+            raise CpuPlanError(
+                f"full_cpu_frequency: sched_setattr refused uclamp.min: {os.strerror(ctypes.get_errno())}. It needs a "
+                "kernel with CONFIG_UCLAMP_TASK and a sandbox that allows sched_setattr on the process's own threads "
+                "(no capability otherwise); turn the knob off on this host"
+            )
+    try:
+        governor = (cpu_root / f"cpu{min(os.sched_getaffinity(0))}/cpufreq/scaling_governor").read_text().strip()
+    except OSError:
+        governor = "unknown"
+    logger.log(
+        logging.INFO if governor == "schedutil" else logging.WARNING,
+        "full_cpu_frequency: uclamp.min %d on this process's %d threads; governor %s, and only schedutil reads it",
+        _SCHED_CAPACITY_SCALE, len(tids), governor,
+    )
 
 
 # ── building it ─────────────────────────────────────────────────────────────

@@ -22,6 +22,7 @@ KNOBS: dict[str, str] = {
     "step_thread_core": "MSTAR_STEP_THREAD_CORE",
     "compile_deterministic": "MSTAR_COMPILE_DETERMINISTIC",
     "idle_hold": "MSTAR_IDLE_HOLD",
+    "full_cpu_frequency": "MSTAR_FULL_CPU_FREQUENCY",
     "resident_planning": "MSTAR_RESIDENT_PLANNING",
 }
 
@@ -51,6 +52,8 @@ def check(settings: Mapping[str, object] | None) -> dict[str, str]:
             out[key] = _idle_hold_value(value)
         elif key == "resident_planning":
             out[key] = _resident_planning_value(value)
+        elif key == "full_cpu_frequency":
+            out[key] = _full_cpu_frequency_value(value)
         elif isinstance(value, bool):
             out[key] = "1" if value else "0"
         elif isinstance(value, int):
@@ -90,6 +93,13 @@ def _idle_hold_value(value: object) -> str:
     if isinstance(value, str) and value.strip().lower() in ("qos", "off"):
         return value.strip().lower()
     raise ValueError(f"`knobs: idle_hold` must be qos or off, got {value!r}")
+
+
+def _full_cpu_frequency_value(value: object) -> str:
+    text = str(int(value)) if isinstance(value, bool) else str(value).strip()
+    if text in ("0", "1"):
+        return text
+    raise ValueError(f"full_cpu_frequency must be true or false, and MSTAR_FULL_CPU_FREQUENCY 1 or 0, got {value!r}")
 
 
 def configure(settings: Mapping[str, object] | None) -> None:
@@ -211,6 +221,13 @@ def pre_plan_enabled() -> bool:
     4 layers), where the step is too short to hide the planning in and the
     extra thread is just GIL contention."""
     return _setting("pre_plan", "1") == "1"
+
+
+def full_cpu_frequency_enabled() -> bool:
+    """``full_cpu_frequency`` / ``MSTAR_FULL_CPU_FREQUENCY`` (default off): every
+    thread of the deployment asks for full CPU frequency while it runs
+    (``cpus.run_at_full_frequency``)."""
+    return _full_cpu_frequency_value(_setting("full_cpu_frequency", "0")) == "1"
 
 
 def step_thread_core() -> str | int:

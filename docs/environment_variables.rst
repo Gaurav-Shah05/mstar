@@ -568,6 +568,25 @@ Worker scheduling
        workers it starts: they build the same plan, but only the API server
        knows which set was free. Not meant to be set by hand. Read by
        ``cpus.devices_plan``.
+   * - ``MSTAR_FULL_CPU_FREQUENCY``
+     - config's ``knobs: full_cpu_frequency``, else ``0``
+     - Every thread of the deployment asks the kernel for the CPU's top clock
+       while it runs: the API server sets ``uclamp.min`` to 1024 on its threads
+       before it starts the conductor, and all that starts afterwards inherits
+       it. Idle threads stay asleep. Under the ``schedutil`` governor a thread
+       that sleeps and wakes often reads as lightly loaded and runs below the
+       top clock: on a Xeon 8460Y+, a thread running 1 ms bursts between sleeps
+       went from 800 to 2000 MHz and did 2.0 to 2.4x the work. Only
+       ``schedutil`` reads the clamp; another governor logs a warning. It needs
+       a kernel with ``CONFIG_UCLAMP_TASK`` and a sandbox that allows
+       ``sched_setattr`` on the process's own threads (no capability otherwise).
+       A host that refuses stops the server at startup, since a deployment that
+       asked for this clock would otherwise run slower with only a log line to
+       say so. A system or cgroup limit (``sched_util_clamp_min``,
+       ``cpu.uclamp.max``) can lower what the kernel applies without refusing.
+       Off by default: a higher clock spends power, so a deployment opts in.
+       Read by ``knobs.full_cpu_frequency_enabled``, applied by
+       ``cpus.run_at_full_frequency``.
    * - ``MSTAR_IDLE_HOLD``
      - config's ``knobs: idle_hold``, else ``off``
      - ``qos`` has the API server open ``/dev/cpu_dma_latency``, write a
