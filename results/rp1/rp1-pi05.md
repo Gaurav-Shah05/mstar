@@ -5,10 +5,10 @@ Base: run-base e8826a777. GPU: 1x H200. Headline: action-chunk latency p50 at c=
 ## Current state (2026-11-05 05:05 UTC; machine offline 06:00-18:00Z)
 
 - Best on run-base: perf/rp1-pi05 at 3c4fdfa9a. c=1 p50 about 32 ms alone (the previous best about 34 alone, 38-39 side by side).
-- Side task done: perf/rp1-main at 8adf90628, gated, checkpoint reported; see On main.
+- Side task done: perf/rp1-main at e69bba837 with H28, gated; checkpoint reported at 8adf90628; see On main.
 - perf/rp1-h28 (0d580d734) is superseded by the commits on perf/rp1-pi05; it is what s_h28 measured.
 - GPU idle, nothing running. /workspace/loop/deadline set to 1793982000.
-- H28 KEPT (56bf52485, d9488150f, 41cfe0175, 1d266b36e, 914fd992c, 3c4fdfa9a). Next: port to perf/rp1-main and gate; checkpoint 5 (due); then re-measure H21, H22 under the sequential protocol (H25 is contained in H28). Sequential rounds use round.sh, not pair_round.sh.
+- H28 KEPT (56bf52485, d9488150f, 41cfe0175, 1d266b36e, 914fd992c, 3c4fdfa9a). Ported to perf/rp1-main and gated. Running: checkpoint 5 (chain18.sh, sequential). Then re-measure H21, H22 under the sequential protocol (H25 is contained in H28). Sequential rounds use round.sh, not pair_round.sh.
 - On return: check /workspace survived; if not, restore from perf/rp1-results (results/rp1/, tools/ holds the harness, ref/ the reference actions) and rebuild the venvs and droid-cache. A new variant of H28 that gains more at c=1 is the next round, since any H28 re-run is only worth it with a real change: per-node bucket padding for the ~930-token prefix, or cutting the 2.3 ms client-side and 0.9 ms worker hops. Then take the c=8 mean: H28 p50 99.5 but mean about 109, so some rows run slow (not diagnosed).
 
 ## On main (status 2026-11-05 00:45 UTC; branch perf/rp1-main at 9c6f1ad75, venv /workspace/venv-main)
@@ -17,7 +17,9 @@ Base: run-base e8826a777. GPU: 1x H200. Headline: action-chunk latency p50 at c=
 - **Reworked:** H0b (cc2349495, 46cc72666): only the antialiased resize remains, since main already builds openpi's prompt and bins state as openpi (482dfc764, 41a1bb31d).
 - **Dropped:** 65219f863, a1a514507, 80cfab490 (cameras and prefix scaling: main's 41a1bb31d / #800 does it); 879f3d40b (prompt and binning test, same reason).
 - **Gate:** parity tests in venv-main 68 passed (main_parity_gpu.log). Targeted test/modular, port vs 9c6f1ad: same 40 failed, 3 errors on both; 2853 vs 2838 passed (main_tests*.log). 16-input openpi comparison on main_gate_base15.yaml (pi05_base, 3 cameras, horizon 15, what the reference ran): PASS, sequential max 0.0196, c=8 max 0.0235.
-- **Gate limit:** main's own pi05_droid.yaml serves lerobot/pi05_droid with 2 cameras and norm stats; the openpi reference uses pi05_base, so it cannot gate that config. There the port differs from 9c6f1ad by max 0.413, mean 0.0103. On the reference-comparable config unported 9c6f1ad FAILS (max 1.400, mean 0.149) and the port passes, so the port corrects real error on main; that the DROID difference is the same correction is likely but not verified, and which commit fixes what on main was not isolated.
+- **Correction (2026-11-06): the "unported main FAILS max 1.400, mean 0.149" reported earlier was a harness error.** gate_client.py imports benchmark.dataset from its working directory, and main's sends 2 cameras and a raw unpadded state where run-base's, which the reference was made from, sends 3 cameras and a padded state. That run used main's dataset; the port's first pass used run-base's. With run-base's client on both (main_gate_fixed.sh): unported 9c6f1ad FAIL max 0.100, mean 0.0059 (c=8 0.097-0.099); port with H28 PASS max 0.0203 (c=8 0.0203). So the port does correct a real difference on main, about 2x tolerance, not 27x.
+- **Gate limit:** main's own pi05_droid.yaml serves lerobot/pi05_droid with 2 cameras and norm stats; the openpi reference uses pi05_base, so it cannot gate that config. There the port differs from 9c6f1ad by max 0.413, mean 0.0103; that it is the same correction is likely, not verified.
+- **Workloads differ between branches:** main's benchmark dataset sends 2 images per request, run-base's 3, so main's latencies are not comparable with run-base's. Each checkpoint's two arms use one tree's client, main's on main, so they compare with each other.
 - **Checkpoint on main, batch h200_1104, status counted, 36 rows (01:50-03:10 UTC approx):** `main_pair_round.sh mck_droid|mck_base <9c6f1ad75> <8adf90628> <config> 3`, FE_FLAG=--rust-frontend (it serves pi0.5: 0 failures, actions within noise of the default frontend, logs/main_fe), MSTAR_SHM_ARENA=1, step_thread_core: siblings on both arms. c=1 from paired_c1.py, c=4/8 from benchmark.runner.
   pi05_droid.yaml:
   c=1 main: p50 [75.1, 75.42, 88.25] p99 [88.03, 84.56, 99.74] thr [13.249, 13.262, 11.283]
@@ -34,6 +36,8 @@ Base: run-base e8826a777. GPU: 1x H200. Headline: action-chunk latency p50 at c=
   c=8 main: p50 [218.01, 208.22, 140.2] p99 [421.23, 320.43, 218.87] thr [34.404, 37.095, 55.258]
   c=8 port: p50 [94.65, 95.09, 95.06] p99 [126.84, 121.94, 115.54] thr [81.948, 80.24, 79.612]
 - **Caveats:** a harness bug (`local k=$1 out=$L/r$k`) wrote every round to one r/ directory, now fixed, so rows come from the RESULT lines (report_main_out.py) and per-round server logs and gate files exist only for each config's last round; the capture check covers only those (both clean). So a dropped capture in rounds 1-2 cannot be ruled out from logs. pi05_droid main's round 3 (c=1 88.25, c=8 205) is slow with captures clean and unexplained. Baseline's outputs are the ones that fail the reference on the comparable config, so this is speed against main, not like for like on correctness.
+
+- **H28 on main (kept on run-base as 56bf52485..3c4fdfa9a), ported, tip e69bba837:** 1cbc4a30d, ed97dbb72, 4f894f491, 38d1af8fa, f1a5751c8, e69bba837. Conflicts: imports in engine.py; pi05_droid.yaml, the prefix layout and the old combined constructor kept main's content; tests kept main's plus the new ones. Gate: reference config (main_gate_base15b.yaml, run-base's client) PASS max 0.0203, c=8 0.0203; pi05_droid.yaml within noise of the previous port (max 0.012), c=8 max 0.016; no dropped captures; parity tests 69 passed. Targeted test/modular 22 failed, 1 error, 2407 passed; the failures outside the earlier list (test_audio_watermark, test_client_error_text, test_qwen3_tts_model, test_whisper_model, test_chatterbox_model) also fail at 9c6f1ad. No new main checkpoint run for it.
 
 ## Corrections (read first; 2026-11-04 03:10 UTC)
 
