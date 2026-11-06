@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import yaml
 
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.resources.kv.config import KVSpec
@@ -293,6 +294,20 @@ def test_pi05_kv_cache_config_matches_pi05_config():
     assert kv.num_kv_heads == model.config.num_kv_heads
     assert kv.head_dim == model.config.head_dim
     assert kv.num_qo_heads == model.config.num_qo_heads
+
+
+@pytest.mark.parametrize("config_name", ["pi05.yaml", "pi05_droid.yaml"])
+def test_pi05_deployments_pin_flashinfer_fa2(config_name):
+    """The model keeps FlashInfer's "auto" kernel; the pi05 deployments pin
+    FA2, and the override has to reach the LLM node's attention."""
+    from mstar.engine.resources import AttentionSpec
+    from mstar.engine.resources.spec import apply_yaml_overrides
+
+    specs = _make_model().get_node_resources()
+    attn = next(spec for spec in specs if isinstance(spec, AttentionSpec))
+    assert attn.config.flashinfer_backend == "auto"
+    apply_yaml_overrides(specs, yaml.safe_load((Path(CONFIG_PATH).parent / config_name).read_text()))
+    assert attn.config.flashinfer_backend == "fa2"
 
 
 # ----------------------------------------------------------------------
