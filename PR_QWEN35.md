@@ -1,4 +1,4 @@
-IN PROGRESS: review fixes under test (head d96154d), then sweep, ladder, gates, references
+IN PROGRESS: sweep at head 362e11d, then ladder, gates, references
 
 # PR Qwen3.5 facts
 
