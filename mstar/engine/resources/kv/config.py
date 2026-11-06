@@ -600,7 +600,7 @@ def prefix_caches_by_rank(
 @dataclass
 class KVSpec(NodeResourceSpec):
     config: KVConfig
-    # Under CFG parallel, the node whose pool admits each request. The other nodes' pools hold no
+    # With several nodes (CFG parallel, say), the node whose pool admits each request. The other nodes' pools hold no
     # more pages per request than the leader's, as long as the leader offloads nothing.
     leader: str | None = None
 
