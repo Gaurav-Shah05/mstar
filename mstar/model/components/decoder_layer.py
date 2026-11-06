@@ -118,8 +118,7 @@ class GatedDecoderLayer(nn.Module):
     The norms must be ``AdaRMSNorm``-shaped: ``forward(x, cond)`` returns
     ``(normed, gate)``. The residual becomes ``x + gate * y``.
 
-    Used by pi05's action expert; ``adarms_cond`` is the shared condition
-    vector consumed by both norms.
+    Used by pi05's action expert; ``adarms_cond`` is passed to both norms as is.
     """
 
     def __init__(
