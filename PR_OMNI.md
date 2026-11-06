@@ -1,4 +1,4 @@
-IN PROGRESS: main-vs-PR A/B (3 rounds) and full test runs at the split point and head
+IN PROGRESS: full test runs at the split point and head; T2S attribution check (after concept 5 vs head) next
 
 # PR facts: Qwen3-Omni
 
@@ -101,3 +101,34 @@ Talker: sampling is seeded per request but differs between server processes, so 
 | p90 | 0.209 | 0.376 |
 | answers above 0.5 | 1 | 2 (Fisher exact p = 1.0) |
 Text-only T2S prompts run code the PR does not change (prefill_text rows; masks still built since they speak; no audio encoder). The loop's noise floor for this measure was per-arm means 0.035-0.085 on identical code. A second sample per arm comes from the A/B's round 1 (audio kept).
+
+## Main against PR
+
+Arms: `M* main 305e80e` (baseline; /workspace/wt-main305, venv-main305) and `M* pr-omni 82ad7e695` (candidate; venv-pr, PYTHONPATH at a detached worktree of the head). Ladder arms at the headline cells: after concept 4 (134d42d0f), after concept 5 (e922f3434); after concept 6 is the head.
+Settings, same on every arm: configs/qwen3omni_colocated.yaml as in each tree (identical), one H200, `--rust-frontend`, MSTAR_SHM_ARENA=1, MSTAR_STEP_THREAD_CORE=siblings (the env form of `step_thread_core: siblings`), no full_cpu_frequency / step_thread_util_min knobs (absent on main) and no uclampset. Fresh server per round, one untimed warm pass per server (T2T, A2T, T2S at c=8 on rows disjoint from the measured ones), each A2T cell on LibriSpeech validation-clean rows no earlier cell on that server sent. Requests per cell: A2T 16 x c (min 64), T2T and T2S 5 x c (min 32). Harness /workspace/prwork/round_pr.sh + ab_pr.sh, client /workspace/results/tools/omni_bench.py (benchmark.runner), one per-arm Inductor cache kept across that arm's rounds. Order: round 1 main, c4, c5, head; round 2 head, c5, c4, main; round 3 main, c4, c5, head.
+Round 1 of main ran while CPU test suites were still being stopped (its A2T c=1 and c=8 cells overlapped them: 38.8 and 237 tok/s); it is kept as runs/pr_ab/r1x_main_contended, not counted or reported, and main's round 1 was rerun after round 3.
+
+Median [min-max] of 3 rounds; throughput tok/s (A2T, T2T) or audio-s/s (T2S); latency p50 is TTFT (A2T, T2T) or TTFA (T2S); ratio head/main of medians, "all above/below" when the ranges do not overlap. No request failed in any counted cell.
+
+| cell | metric | main | c4 | c5 | head | head/main |
+|---|---|---|---|---|---|---|
+| a2t_c1 | tput | 197.3 [195.8-198.3] | n/a | n/a | 199.3 [198.2-200.0] | 1.010 |
+| a2t_c1 | p50 ms | 39.5 [39.3-40.7] | n/a | n/a | 39.6 [38.9-40.5] | 1.001 |
+| a2t_c8 | tput | 564.6 [562.4-568.8] | n/a | n/a | 593.6 [586.4-598.1] | 1.051 (all above) |
+| a2t_c8 | p50 ms | 69.8 [67.5-70.3] | n/a | n/a | 67.7 [66.0-67.8] | 0.969 |
+| a2t_c32 | tput | 1265.0 [1260.2-1302.7] | 1387.1 [1377.6-1407.2] | 1403.3 [1390.4-1405.1] | 1525.7 [1525.0-1531.4] | 1.206 (all above) |
+| a2t_c32 | p50 ms | 115.3 [114.9-117.1] | 106.3 [104.7-107.7] | 106.6 [106.1-109.1] | 142.9 [137.5-143.3] | 1.239 (all above) |
+| t2t_c1 | tput | 310.2 [310.1-310.4] | n/a | n/a | 314.9 [314.7-315.1] | 1.015 (all above) |
+| t2t_c1 | p50 ms | 26.4 [26.3-26.8] | n/a | n/a | 26.7 [26.2-26.9] | 1.011 |
+| t2t_c32 | tput | 2288.0 [2286.7-2293.2] | n/a | n/a | 2294.6 [2289.5-2296.1] | 1.003 |
+| t2t_c32 | p50 ms | 61.4 [60.9-64.8] | n/a | n/a | 61.4 [60.8-65.1] | 1.000 |
+| t2s_c1 | tput | 20.1 [20.1-20.1] | n/a | n/a | 20.0 [20.0-20.0] | 0.995 (all below) |
+| t2s_c1 | p50 ms | 116.2 [116.2-116.7] | n/a | n/a | 115.7 [115.5-116.4] | 0.995 |
+| t2s_c4 | tput | 43.9 [43.6-44.1] | n/a | n/a | 43.3 [43.2-43.6] | 0.986 (all below) |
+| t2s_c4 | p50 ms | 177.5 [175.7-181.1] | n/a | n/a | 178.1 [177.7-178.6] | 1.003 |
+| t2s_c16 | tput | 99.7 [98.5-100.0] | 98.8 [98.8-99.9] | 99.6 [99.5-99.8] | 99.0 [98.9-100.8] | 0.992 |
+| t2s_c16 | p50 ms | 261.5 [261.0-262.2] | 262.1 [255.8-262.5] | 257.7 [252.2-257.8] | 261.1 [256.4-271.6] | 0.998 |
+| t2s_c32 | tput | 148.8 [148.4-148.9] | n/a | n/a | 149.9 [147.6-150.4] | 1.007 |
+| t2s_c32 | p50 ms | 331.4 [318.6-332.3] | n/a | n/a | 333.9 [326.1-340.1] | 1.007 |
+
+All 66 rows reported with mstar-report (batch h200_1106, status counted, hypothesis "PR check: Qwen3-Omni"; each row's config names every flag and knob).
