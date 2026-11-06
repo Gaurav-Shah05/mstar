@@ -168,6 +168,10 @@ class Pi05Model(Model):
     """Pi0.5 vision-language-action model implementation."""
 
     PREPROCESS_ONLY_KWARGS = ("robot_state",)
+    # load_image and process_prompt read no shared state but the fast tokenizer's
+    PREPROCESS_PARALLEL = True
+    # load_image is a PNG decode per camera, and only that
+    PREPROCESS_PARALLEL_IMAGES = True
 
     PREFILL_WALK = "prefill"
     ACTION_GEN_WALK = "action_gen"
