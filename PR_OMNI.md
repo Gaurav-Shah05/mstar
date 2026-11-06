@@ -1,4 +1,4 @@
-IN PROGRESS: full test runs at the split point and head; T2S attribution check (after concept 5 vs head) next
+IN PROGRESS: T2S attribution check (after concept 5 vs head)
 
 # PR facts: Qwen3-Omni
 
@@ -99,6 +99,15 @@ Per commit (ruff + the 34 test/modular files that import qwen3_omni, plus mstar/
 | e922f3434 | pass | 2061 passed, 41 skipped |
 | a0c06b469 | pass | scheduler files (test_loop_turns, test_micro_scheduler, test_resident_delta, test_scheduler_room, test_tp_follow_targeted_gate): 252 passed |
 | 82ad7e695 | pass | the same + test_gather_policy: 261 passed |
+
+Full `pytest test/modular -q`, serial, at the split point (e922f3434, before concept 6) and at head (82ad7e695), run side by side on a quiet host:
+| | failed | passed | skipped |
+|---|---|---|---|
+| base 305e80e (OMP_NUM_THREADS=2) | 2 | 11460 | 1291 |
+| e922f3434 | 4 | 11467 | 1292 |
+| 82ad7e695 | 4 | 11476 | 1292 |
+The four failures at both commits: test_client_error_text.py::test_a_transcription_whose_decode_fails_in_the_frontend_answers_with_an_error_id (fails at base too) and three test_wan_vae_decode.py cases (test_warm_cache_stream_is_the_whole_stream_decode[wan21], [wan22], test_clip_start_alone_and_a_ragged_tail[1-False-wan22]). These two runs did not set OMP_NUM_THREADS=2 as the baseline did (a wrapper omission); AGENTS.md documents test_wan_vae_decode.py's bit-exact cases as failing at 4-8 intra-op threads. Rerun with the baseline's settings (OMP_NUM_THREADS=2, PYTHONHASHSEED=0) at both commits: test_wan_vae_decode.py, test_client_error_text.py and test_tp_read_failure_acceptance.py give 1 failed, 68 passed each, the failure being the pre-existing test_client_error_text one. test_tp_read_failure_acceptance[text_only], which failed in the baseline run (under load), passes at both commits. No new failures.
+Note on these runs: when their 2-hour `timeout` wrappers were removed at 65% so the runs could finish, the wrapper's cleanup deleted their --basetemp directories for about 10 s before they were recreated; no test errored on a missing temp path (no ERROR lines).
 
 New tests fail without their code commit (checked in a worktree at the parent with the test file checked out):
 - concept 2: both test_qwen3_omni_thinker_* in test_step_prep_host_syncs.py fail (scalar index writes; sync-debug error on CUDA).
