@@ -4,11 +4,11 @@ Base: run-base e8826a777. GPU: 1x H200. Headline: action-chunk latency p50 at c=
 
 ## Current state (2026-11-05 05:05 UTC; machine offline 06:00-18:00Z)
 
-- Best on run-base: perf/rp1-pi05 at 3444a8779. c=1 p50 about 38-39 ms (run-base about 106).
+- Best on run-base: perf/rp1-pi05 at 3c4fdfa9a. c=1 p50 about 32 ms alone (the previous best about 34 alone, 38-39 side by side).
 - Side task done: perf/rp1-main at 8adf90628, gated, checkpoint reported; see On main.
-- Not kept, closest candidate: H28, branch perf/rp1-h28 (WIP commit on top of 3444a8779). Not on perf/rp1-pi05 and not on perf/rp1-main.
+- perf/rp1-h28 (0d580d734) is superseded by the commits on perf/rp1-pi05; it is what s_h28 measured.
 - GPU idle, nothing running. /workspace/loop/deadline set to 1793982000.
-- s_h28 done: H28 PASSES under the brief's sequential protocol; being cleaned into commits. Then re-measure H21, H22, H25, which failed only under the paired harness (their patches are in rp1-pi05-tools/).
+- H28 KEPT (56bf52485, d9488150f, 41cfe0175, 1d266b36e, 914fd992c, 3c4fdfa9a). Next: port to perf/rp1-main and gate; checkpoint 5 (due); then re-measure H21, H22 under the sequential protocol (H25 is contained in H28). Sequential rounds use round.sh, not pair_round.sh.
 - On return: check /workspace survived; if not, restore from perf/rp1-results (results/rp1/, tools/ holds the harness, ref/ the reference actions) and rebuild the venvs and droid-cache. A new variant of H28 that gains more at c=1 is the next round, since any H28 re-run is only worth it with a real change: per-node bucket padding for the ~930-token prefix, or cutting the 2.3 ms client-side and 0.9 ms worker hops. Then take the c=8 mean: H28 p50 99.5 but mean about 109, so some rows run slow (not diagnosed).
 
 ## On main (status 2026-11-05 00:45 UTC; branch perf/rp1-main at 9c6f1ad75, venv /workspace/venv-main)
@@ -488,4 +488,6 @@ API path at 6eba3b986, c=1, trace_clean2 (173 requests, E2E p50 37 ms): first fo
 - gate PASS on every arm (max 0.0196-0.0226), concurrent gate PASS at c=1,4,8,16 (max 0.0235), no dropped captures.
 - **Judgement calls, stated plainly:** (1) The protocol changed after the candidate failed, on the evidence that a side-by-side server inflates both arms (best c=1 about 39 paired, about 34 alone). The sequential protocol is the brief's own, but this is still a re-measure of a failed candidate. (2) c=4 p99 is worse with non-overlapping rounds (about +4%). Kept because that workload improves in p50, mean and throughput; if p99 alone counts as a regressed workload, this does not pass.
 - Rounds earlier in this file measured with pair_round.sh are not directly comparable to sequential numbers.
+- H28 commits: review (subagent, no GPU): no veto on shipped configs. Fixed after measuring, pi0.5's serving behaviour unchanged except where stated: split into separate submodule classes and a named walk `action_chunk`; startup refusal of the experts on different ranks (review traced wrong actions there, not run); `share_slot_rotations` merge that stranded a node (no shipped model has that shape); integration test and stale comments. Measured tree 0d580d734; the restructured tree passed the concurrent gate at c=1,4,8,16 (max 0.0222, gate_c_h28final.out) before the last review fixes, whose final form has targeted tests only. Noted, unchanged: unreachable buckets (1,1936), (1,3872), (2,3872) are captured; no modular test drives LLM to action_expert through admit, pre-plan and commit, which only the GPU gate covers; test/pi05/probe_mstar_vs_lerobot.py was already stale (calls a removed `_preprocess_prefill`); Bagel's slot order changes, not run on GPU.
+- Rule break named per the amendment: invariant 8 (both experts must be on the same ranks). test/integration/test_pi05_real_weights.py SKIPS on both trees (lerobot not installed), so it is no evidence. Targeted test/modular: 22 failed, 1 error, 1870 passed, none new against modular_ckpt4_failed.txt.
 
