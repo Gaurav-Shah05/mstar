@@ -849,3 +849,12 @@ M* leads every 9B point, already at 9c6f1ad on most. 9B is GPU-bound on this hos
 - iter_total 10.92 ms (was 13.08), event_sync 6.64 (61%). Decode 370 steps gpu_exec 10.71 (3962 ms), mixed 116 steps 17.61 (2043), audio encoder 114 steps 4.59 (524). Mixed gpu_thread.total 14.81 -> 4.48 ms, exec 4.02 -> 2.86: the prepare_inputs time did not reappear elsewhere, which is what round 18's correction note left open. Mixed event_sync 14.3 -> 14.0 ms, unchanged. The step is now GPU-led.
 - Next lead, hypothesis: rows average 21 while Thinker decode captures are 16 and 32, so most decode steps replay the 32-row graph; the moe_gemm sweep times M=24 at 222 us against M=32 at 248 us (-10%). Finer decode batch sizes (12, 20, 24, 28) could cut decode's 60% of wall. Not a full round: too little time left. Single-round probe below; a full 3-round A/B is the next round.
 - Probe (one round, candidate then base, /workspace/rp3-main/p19.sh; not a round by section 4): decode captures at 1, 2, 4, 8, 12, 16, 20, 24, 28, 32 rows (82 Thinker captures vs 74, 136 MiB) | afbf77c, c32 n=600: 67.7 req/s, TTFT p50 107 ms | 68.9, 96 ms. No sign of a gain: dropped, no commit. Supports the same result as rounds 2 and 8: padding is not what these steps cost on this GPU.
+
+## PR Qwen3.5 (2026-11-06; base 305e80e; branch perf/rp3-pr-qwen35, head 6bfc962; facts in PR_QWEN35.md)
+
+- Scripts /workspace/rp3-pr/{round.sh,round_py.sh,round_ref.sh,round_diag.sh,chain_*.sh,parity35.py,margin.py,gate.py,gate2.py,sum.py}. Results /workspace/results/rp3-pr/{sweep,ladder,cut,pyfront,refs,diag,attr,gate}, modular_*.log and .set. Rows batch h200_1106.
+- Bucket cut kept: 9B Random c=1 TTFT p50 59.9, 58.0, 56.8 to 42.2, 42.9, 42.7; c=16 and c=64 overlap.
+- Main 305e80e is bimodal per server on this host: 0.8B ShareGPT c=64 about 14000 or about 7500 on identical code. Fast boots 13:34 and 14:16 UTC, slow on all others; workload order excluded. Concept 1 arms 14287-16861 in all periods. Cause: hypothesis (host load keeping cores out of deep idle).
+- Python frontend 0.8B ShareGPT c=64 at head: TTFT p50 81 to 940 ms, tok/s 8102 to 10358.
+- 9B gate misses on main and PR, gaps at most 0.25 nats. 2B image greedy distance from main comes in at concept 2.
+- Disk: Qwen3-Omni weights removed (70.5 GB) for Qwen3.5-9B, re-downloadable.
