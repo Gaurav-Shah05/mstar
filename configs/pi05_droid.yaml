@@ -30,7 +30,7 @@ model_kwargs:
             0.7344000000000002, 0.9998]
 
 # FlashInfer FA2 rather than the FA3 kernel "auto" picks on SM90 (H100/H200):
-# the captured action_gen step (10 Euler steps of ~15 action queries over the
+# the captured action step (10 Euler steps of ~15 action queries over the
 # ~900-token prefix) 14.0 -> 10.1 ms on an H200, for +0.3 ms of prefill.
 # Elsewhere "auto" already picks FA2.
 resources:
@@ -45,5 +45,6 @@ node_groups:
 
   - node_names:
       - LLM
+      - action_expert
     ranks:
       - 0
