@@ -1,4 +1,4 @@
-IN PROGRESS: full test runs at the split point and head; correctness scoring; then the main-vs-PR A/B
+IN PROGRESS: main-vs-PR A/B (3 rounds) and full test runs at the split point and head
 
 # PR facts: Qwen3-Omni
 
@@ -71,7 +71,33 @@ Per commit (ruff + the 34 test/modular files that import qwen3_omni, plus mstar/
 | 82ad7e695 | pass | the same + test_gather_policy: 261 passed |
 
 New tests fail without their code commit (checked in a worktree at the parent with the test file checked out):
-- concept 2: both test_qwen3_omni_thinker_* in test_step_prep_host_syncs.py fail (scalar index writes; sync-debug error on CUDA). The CUDA test passed on H200 at fc002c60d.
+- concept 2: both test_qwen3_omni_thinker_* in test_step_prep_host_syncs.py fail (scalar index writes; sync-debug error on CUDA).
+- GPU tests at head (82ad7e695), H200, torch 2.12.1+cu132: test_step_prep_host_syncs.py -k qwen3_omni and test_qwen3_omni_audio_row.py, 8 passed (the CUDA sync-debug test included).
 - concept 4: test_an_audio_row_embeds_its_ids_in_one_call fails on main (2 calls); the equivalence test passes on main once main's lazy sentinel attributes are set, i.e. the row is unchanged.
 - concept 5: the three test_a_request_with_no_audio_output_builds_no_talker_masks cases fail.
 - concept 6: test_gather_policy.py fails to import GatherPolicy; test_a_node_without_a_gather_policy_steps_as_if_nothing_gathered fails (no `_gathering`).
+
+## Correctness (gate runs: one fresh server per arm, /workspace/prwork/runs/gate; same harness and settings as the A/B)
+
+Thinker, 64 fixed LibriSpeech validation-clean clips (rows 0-63), greedy, exact token ids, HF transformers Qwen3-Omni-30B-A3B-Instruct bf16 teacher-forced on each run's tokens (/workspace/results/tools/hf_ref.py, reference /workspace/results/ref from the loop):
+
+| | main 305e80e | PR head 82ad7e695 | HF sdpa | HF eager |
+|---|---|---|---|---|
+| corpus WER | 20.84% | 21.13% | 15.29% | 15.19% |
+| WER excluding the answered clip | 0.88% | 0.88% | 1.08% | 1.08% |
+| clips answered instead of transcribed | 1 (clip 4) | 1 (clip 4) | 1 | 1 |
+| transcripts identical to HF sdpa | 61/64 | 60/64 | | |
+| teacher-forced top-1 agreement (hf_ref) | 0.99660 | 0.99456 | | sdpa on eager 0.99804 |
+| agreement, second HF pass (hf_diag) | 0.99184 (12 diffs) | 0.99252 (11 diffs) | sdpa on itself 0.99739 | |
+
+- The literal bar (agreement >= HF self-agreement 0.99804) is missed by main as well as by the PR, and HF misses it against itself in a second pass (0.99739). Every disagreement in both arms has an HF top-1 margin of 0.0, 0.125 or 0.25 logits, i.e. a bf16 tie (hf_diag.log). Head's mismatches: clip 4 (the free-form answer, 7 tokens) and clip 52 (1 token, margin 0.125). The gate as applied in the loop (no disagreement above 0.25 logits; WER excluding answered clips no worse) passes.
+- Corpus WER differs only through clip 4, which both arms answer at length instead of transcribing.
+
+Talker: sampling is seeded per request but differs between server processes, so codec tokens are not comparable across arms. ASR round trip instead (benchmark.answer_audio_wer, Whisper large-v3-turbo, each spoken answer against its own text), T2S c=4, 32 answers per arm:
+| | main | head |
+|---|---|---|
+| mean WER | 0.093 | 0.108 |
+| median | 0.045 | 0.059 |
+| p90 | 0.209 | 0.376 |
+| answers above 0.5 | 1 | 2 (Fisher exact p = 1.0) |
+Text-only T2S prompts run code the PR does not change (prefill_text rows; masks still built since they speak; no audio encoder). The loop's noise floor for this measure was per-arm means 0.035-0.085 on identical code. A second sample per arm comes from the A/B's round 1 (audio kept).
