@@ -1,4 +1,4 @@
-IN PROGRESS: 9B and short-list rounds, then the full serial test
+IN PROGRESS: last 9B rounds, then the full serial test
 
 # PR_CPUFREQ facts
 
@@ -88,17 +88,24 @@ One H200, Xeon 8460Y+, torch and CUDA as in `venv-pr`/`venv-main305`. Arms: `M* 
 ## q08b
 | cell | arm | tok/s median [min-max] | x main | TTFT p50 ms median [min-max] | step-core MHz by round | mem ns by round | failed |
 |---|---|---|---|---|---|---|---|
-| Qwen3.5-0.8B ShareGPT c=1 | mainuclamp | 770.1 [770.1-770.1] | nan | 10.9 [10.9-10.9] | 3100 | 149 | 0 |
-| Qwen3.5-0.8B ShareGPT c=1 | on | 702.2 [666.6-737.8] | nan | 12.5 [11.6-13.4] | 3050 1414 | 149 149 | 0 |
-| Qwen3.5-0.8B ShareGPT c=64 | mainuclamp | 16050.8 [16050.8-16050.8] | nan | 21.5 [21.5-21.5] | 3700 | 149 | 0 |
-| Qwen3.5-0.8B ShareGPT c=64 | on | 15924.8 [15698.8-16150.7] | nan | 21.8 [21.3-22.2] | 3700 2594 | 150 150 | 0 |
+| Qwen3.5-0.8B ShareGPT c=1 | mainuclamp | 736.5 [488.3-770.1] | nan | 11.4 [10.9-17.1] | 3100 3100 805 | 149 148 151 | 0 |
+| Qwen3.5-0.8B ShareGPT c=1 | on | 711.8 [666.6-737.8] | nan | 12.1 [11.6-13.4] | 3050 1414 2439 | 149 149 148 | 0 |
+| Qwen3.5-0.8B ShareGPT c=64 | mainuclamp | 11862.6 [11652.9-16050.8] | nan | 27.3 [21.5-30.4] | 3700 2000 2000 | 149 158 149 | 0 |
+| Qwen3.5-0.8B ShareGPT c=64 | on | 15698.8 [11791.6-16150.7] | nan | 22.2 [21.3-27.3] | 3700 2594 1987 | 150 150 150 | 0 |
+## q08c
+| cell | arm | tok/s median [min-max] | x main | TTFT p50 ms median [min-max] | step-core MHz by round | mem ns by round | failed |
+|---|---|---|---|---|---|---|---|
+| Qwen3.5-0.8B ShareGPT c=1 | main | 468.4 [449.9-486.8] | 1.000 | 17.5 [16.9-18.2] | 800 2000 | 148 155 | 0 |
+| Qwen3.5-0.8B ShareGPT c=64 | main | 10916.6 [10507.6-11325.6] | 1.000 | 38.0 [36.8-39.2] | 2000 2000 | 149 152 | 0 |
 ## q9
 | cell | arm | tok/s median [min-max] | x main | TTFT p50 ms median [min-max] | step-core MHz by round | mem ns by round | failed |
 |---|---|---|---|---|---|---|---|
-| Qwen3.5-9B ShareGPT c=1 | main | 183.2 [183.2-183.2] | 1.000 | 21.9 [21.9-21.9] | 3100 | 149 | 0 |
-| Qwen3.5-9B ShareGPT c=1 | off | 186.7 [186.7-186.7] | 1.019 | 24.0 [24.0-24.0] | 2000 | 152 | 0 |
-| Qwen3.5-9B ShareGPT c=64 | main | 6471.2 [6471.2-6471.2] | 1.000 | 44.8 [44.8-44.8] | 2000 | 149 | 0 |
-| Qwen3.5-9B ShareGPT c=64 | off | 6490.0 [6490.0-6490.0] | 1.003 | 44.3 [44.3-44.3] | 2000 | 149 | 0 |
+| Qwen3.5-9B ShareGPT c=1 | main | 185.3 [183.2-187.4] | 1.000 | 22.4 [21.9-23.0] | 3100 2000 | 149 149 | 0 |
+| Qwen3.5-9B ShareGPT c=1 | off | 186.7 [186.7-186.7] | 1.008 | 24.0 [24.0-24.0] | 2000 | 152 | 0 |
+| Qwen3.5-9B ShareGPT c=1 | on | 186.6 [185.8-187.4] | 1.007 | 21.2 [17.1-25.4] | 982 2997 | 232 144 | 0 |
+| Qwen3.5-9B ShareGPT c=64 | main | 6480.4 [6471.2-6489.6] | 1.000 | 44.6 [44.5-44.8] | 2000 2000 | 149 148 | 0 |
+| Qwen3.5-9B ShareGPT c=64 | off | 6490.0 [6490.0-6490.0] | 1.001 | 44.3 [44.3-44.3] | 2000 | 149 | 0 |
+| Qwen3.5-9B ShareGPT c=64 | on | 6315.1 [6051.3-6579.0] | 0.975 | 43.9 [36.3-51.5] | 1187 2000 | 251 149 | 0 |
 
 pi0.5 `pi05_droid`: not run. `lerobot/pi05_droid` isn't in `/workspace/hf/hub` on this pod.
 
@@ -588,4 +595,6 @@ Left as they are:
 Permission check (`uc_probe.py`): the `sched_setattr` call succeeds as uid 65534 with no capabilities (CapEff 0), which is what the docs' "no capability otherwise" rests on.
 
 ## Open
-- Results still arriving.
+- **Two clamped states at ShareGPT c=64 on this host.** Knob on and `uclampset` both land at about 16k tok/s or about 11.8k tok/s from round to round, and the low rounds read 2000 MHz on the step cores. Main without a clamp stays at 10.5-11.4k. Why the clock tops out at 2000 in some rounds is not known. Hypothesis, unverified: a host-level limit such as turbo budget under other tenants on this shared machine. An earlier guess that the longer cell list caused the low rounds was tested in `q08b`, and the low state also showed up on the short list, so it is dropped.
+- **Not measured:** power, any governor other than `schedutil`, step_thread_core other than `siblings`, pi0.5 (weights not on this pod).
+- **Whether every thread needs the clamp, or only the step threads.** rp2's step-thread version isn't compared here; the brief asks for one knob. rp2's numbers for that form are in `444a2399`.
