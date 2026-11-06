@@ -873,3 +873,17 @@ def test_pi05_droid_config_serves_the_droid_checkpoint_with_its_stats():
     # 7 joint positions + gripper for the state, 7 joint velocities + gripper for the actions
     assert model.norm_stats.state.q01.numel() == model.norm_stats.state.q99.numel() == 8
     assert model.norm_stats.actions.q01.numel() == model.norm_stats.actions.q99.numel() == 8
+
+
+@pytest.mark.parametrize("action_ranks", [[0], [1]])
+def test_pi05_refuses_experts_in_separate_node_groups(action_ranks):
+    # the same ranks are no better: the conductor picks each group's replica on its own
+    groups = [{"node_names": ["LLM"], "ranks": [0]}, {"node_names": ["action_expert"], "ranks": action_ranks}]
+    with pytest.raises(ValueError, match="one entry"):
+        _make_model().validate_config_yaml({"node_groups": groups}, "pi05.yaml")
+
+
+def test_pi05_shipped_configs_keep_the_experts_together():
+    for name in ("pi05.yaml", "pi05_droid.yaml"):
+        groups = yaml.safe_load((Path(CONFIG_PATH).parent / name).read_text())["node_groups"]
+        assert any({"LLM", "action_expert"} <= set(group["node_names"]) for group in groups)
