@@ -1,4 +1,4 @@
-IN PROGRESS: venvs, baseline tests
+IN PROGRESS: test baseline at the base; then gate and numbers
 
 # PR_CPUFREQ facts
 
