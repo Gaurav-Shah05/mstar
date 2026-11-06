@@ -875,6 +875,15 @@ def test_pi05_droid_config_serves_the_droid_checkpoint_with_its_stats():
     assert model.norm_stats.actions.q01.numel() == model.norm_stats.actions.q99.numel() == 8
 
 
+def test_pi05_prefill_buckets_hold_whole_requests():
+    config = _make_model().config
+    capture = Pi05LLMSubmodule(None, None, config).get_accelerator_graph_configs(torch.device("cpu"))[0]
+    longest = config.num_cameras * config.tokens_per_image + config.max_lang_tokens
+    assert capture.get_total_tokens(1) == [512, longest]
+    assert capture.get_total_tokens(2) == [512, longest, 2 * longest]
+    assert capture.get_total_tokens(4) == [512, longest, 2 * longest, 4 * longest]
+
+
 @pytest.mark.parametrize("action_ranks", [[0], [1]])
 def test_pi05_refuses_experts_in_separate_node_groups(action_ranks):
     # the same ranks are no better: the conductor picks each group's replica on its own
