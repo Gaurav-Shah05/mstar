@@ -1,4 +1,4 @@
-IN PROGRESS: per-commit tests running; main-vs-PR A/B queued after them
+IN PROGRESS: full test runs at the split point and head; correctness scoring; then the main-vs-PR A/B
 
 # PR facts: Qwen3-Omni
 
@@ -48,3 +48,30 @@ Changed after it (history rewritten so each fix sits in the commit that introduc
 - The no-policy test now records every `_gathering` answer through the real method and asserts it was asked and never said yes, then that the steps equal a run with gathering patched out.
 - Trimmed docstrings: GatherPolicy, `_audio_row`, `_media_mask`; fixed the CUDA test docstring.
 - Not changed: the policy's numbers stay in the model (see Open).
+
+## Tests
+
+Baseline, `pytest test/modular -q` serial at base in venv-main305 (CPU only, OMP_NUM_THREADS=2, PYTHONHASHSEED=0):
+2 failed, 11460 passed, 1291 skipped, 38 subtests passed (58:39). Pre-existing failures:
+- test/modular/test_client_error_text.py::test_a_transcription_whose_decode_fails_in_the_frontend_answers_with_an_error_id
+- test/modular/test_tp_read_failure_acceptance.py::test_a_request_beside_the_failed_one_is_bit_identical_to_a_run_without_failure[text_only]
+
+Parallel (`-n 8 --dist loadfile`) was not used: on this host, with the GPU server and other suites running, the base parallel run reached 55% in 1 h 40 min (serial finished in 59 min), and `test_eval_compare.py::test_a_job_whose_lease_is_not_renewed_stops_itself_and_its_servers` (a 1.5 s lease around a fake server's startup) failed under that load in two parallel targeted runs and passed alone. Every later run is serial.
+
+Per commit (ruff + the 34 test/modular files that import qwen3_omni, plus mstar/model/qwen3_omni and the new audio-row test, serial):
+| commit | ruff | targeted |
+|---|---|---|
+| c5685b951 | pass | 2052 passed, 40 skipped |
+| fc002c60d | pass | 2053 passed, 41 skipped |
+| a91d6b869 | pass | 2053 passed, 41 skipped |
+| 134d42d0f | pass | 2058 passed, 41 skipped |
+| e0d9525b0 | pass | 2058 passed, 41 skipped |
+| e922f3434 | pass | 2061 passed, 41 skipped |
+| a0c06b469 | pass | scheduler files (test_loop_turns, test_micro_scheduler, test_resident_delta, test_scheduler_room, test_tp_follow_targeted_gate): 252 passed |
+| 82ad7e695 | pass | the same + test_gather_policy: 261 passed |
+
+New tests fail without their code commit (checked in a worktree at the parent with the test file checked out):
+- concept 2: both test_qwen3_omni_thinker_* in test_step_prep_host_syncs.py fail (scalar index writes; sync-debug error on CUDA). The CUDA test passed on H200 at fc002c60d.
+- concept 4: test_an_audio_row_embeds_its_ids_in_one_call fails on main (2 calls); the equivalence test passes on main once main's lazy sentinel attributes are set, i.e. the row is unchanged.
+- concept 5: the three test_a_request_with_no_audio_output_builds_no_talker_masks cases fail.
+- concept 6: test_gather_policy.py fails to import GatherPolicy; test_a_node_without_a_gather_policy_steps_as_if_nothing_gathered fails (no `_gathering`).
