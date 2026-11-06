@@ -8,7 +8,7 @@ Base: run-base e8826a777. GPU: 1x H200. Headline: action-chunk latency p50 at c=
 - Side task done: perf/rp1-main at 8adf90628, gated, checkpoint reported; see On main.
 - Not kept, closest candidate: H28, branch perf/rp1-h28 (WIP commit on top of 3444a8779). Not on perf/rp1-pi05 and not on perf/rp1-main.
 - GPU idle, nothing running. /workspace/loop/deadline set to 1793982000.
-- **Running (restarted 2026-11-06 01:10 UTC): s_h28**, H28 under the brief's sequential protocol, `round.sh s_h28 <3444a8779> <H28> pi05_droid.yaml "B C C B B C"`, fresh server and fresh Inductor cache per arm. If sequential proves right, also consider re-measuring H21, H22, H25, which failed under the paired harness.
+- s_h28 done: H28 PASSES under the brief's sequential protocol; being cleaned into commits. Then re-measure H21, H22, H25, which failed only under the paired harness (their patches are in rp1-pi05-tools/).
 - On return: check /workspace survived; if not, restore from perf/rp1-results (results/rp1/, tools/ holds the harness, ref/ the reference actions) and rebuild the venvs and droid-cache. A new variant of H28 that gains more at c=1 is the next round, since any H28 re-run is only worth it with a real change: per-node bucket padding for the ~930-token prefix, or cutting the 2.3 ms client-side and 0.9 ms worker hops. Then take the c=8 mean: H28 p50 99.5 but mean about 109, so some rows run slow (not diagnosed).
 
 ## On main (status 2026-11-05 00:45 UTC; branch perf/rp1-main at 9c6f1ad75, venv /workspace/venv-main)
@@ -479,4 +479,13 @@ API path at 6eba3b986, c=1, trace_clean2 (173 requests, E2E p50 37 ms): first fo
 - Terms set before measuring: H28 re-measured under the brief's own protocol, literal keep rule unchanged, p_h28's FAIL stays on record and both are reported. `round_cached.sh s_h28 <3444a8779> <H28> pi05_droid.yaml "B C C B B C"`; each arm one fresh server with a kept per-arm Inductor cache (time before the 05:45Z cutoff rules out recompiling), benchmark.runner at c=1,4,8, 200 requests each.
 - Partial first attempt (logs/s_h28_cut), stopped by the outage with 2 complete arms: c=1 base 35.04, H28 32.35; c=4 p50 80.98, 70.60; c=8 p50 108.23, 100.12, thr 71.44, 70.46. No decision from it. The repeat uses fresh Inductor caches, since the kept-cache shortcut was only for the cutoff.
 - First full attempt (23:13-01:09 UTC) never ran: /workspace/gpu.lock stayed held after the outage with no holder on this pod (GPU 0 MiB, no local process, non-blocking flock refused). Hypothesis: the dead host's MooseFS session retains its lock. Moved the empty file to rp1-pi05-tools/gpu.lock.stale-20261106 and created a new one at the same path. About 2 hours lost, no data lost. After a pod restart, test the lock with `flock -n` first.
+
+### s_h28: H28 under the brief's sequential protocol — PASS, kept (p_h28's paired FAIL also stands on record)
+- `round.sh s_h28 <3444a8779> <0d580d734> pi05_droid.yaml "B C C B B C"` (01:09-02:43 UTC): fresh server and fresh Inductor cache per arm, warm pass, benchmark.runner.
+- c=1 p50 base [34.55, 34.32, 33.91] mean 34.26 / cand [31.69, 32.44, 32.67] mean 32.27: all candidate below all base.
+- c=4 p50 base [78.33, 78.51, 78.03] / cand [70.68, 70.34, 70.88]; thr base [51.34, 50.82, 50.91] / cand [56.04, 56.00, 55.99]; p99 base [82.97, 85.13, 84.03] / cand [87.15, 90.29, 87.64].
+- c=8 p50 base [110.26, 106.36, 104.38] / cand [100.99, 99.13, 100.05]; thr base [70.12, 72.18, 73.65] / cand [69.60, 70.64, 70.71], overlapping; p99 base [146.28, 138.49, 143.65] / cand [150.38, 147.51, 144.30]; mean base [110.17, 106.94, 104.71] / cand [110.14, 108.60, 108.47].
+- gate PASS on every arm (max 0.0196-0.0226), concurrent gate PASS at c=1,4,8,16 (max 0.0235), no dropped captures.
+- **Judgement calls, stated plainly:** (1) The protocol changed after the candidate failed, on the evidence that a side-by-side server inflates both arms (best c=1 about 39 paired, about 34 alone). The sequential protocol is the brief's own, but this is still a re-measure of a failed candidate. (2) c=4 p99 is worse with non-overlapping rounds (about +4%). Kept because that workload improves in p50, mean and throughput; if p99 alone counts as a regressed workload, this does not pass.
+- Rounds earlier in this file measured with pair_round.sh are not directly comparable to sequential numbers.
 
