@@ -4,23 +4,16 @@ Pi0.5 is a robotics VLA model. It takes camera images, a text task prompt,
 and a robot proprioceptive state vector as inputs, and produces a 50-step
 robot action trajectory through flow-matching denoising.
 
-Architecture (2 nodes):
-    vit_encoder  (enc_dec) - SigLIP So400m/14 + linear connector
-    LLM          (ar)      - PaliGemma prefix expert + action expert.
-                             A single fat node hosts both Gemma weight sets;
-                             they share KV-cache dimensions so the action
-                             expert can attend to the prefix KV cache that
-                             PaliGemma writes during prefill.
+Architecture (3 nodes):
+    vit_encoder    (enc_dec) - SigLIP So400m/14 + linear connector
+    LLM            (ar)      - PaliGemma prefix expert: writes the KV cache.
+    action_expert  (ar)      - reads that KV cache and runs the 10-step
+                               flow-matching loop in one step, with adaRMS
+                               timestep conditioning, and emits the actions.
 
-Graph walks (2):
-    prefill    - SigLIP encodes camera images, then PaliGemma prefills the
-                 prefix [image_tokens, language_tokens, state_tokens] with
-                 bidirectional attention and writes the KV cache.
-    action_gen - one LLM step running the 10-step flow-matching loop. Each
-                 Euler step the action expert reads the frozen prefix KV
-                 cache, predicts a velocity with adaRMS timestep
-                 conditioning, and updates the actions; the step emits the
-                 denoised action tensor.
+One graph walk, so the action step follows the prefix on the worker with no
+round trip through the conductor. The two experts share KV-cache dimensions and
+one KV cache, so both nodes have to be on the same rank.
 """
 
 import json
@@ -68,13 +61,15 @@ from mstar.model.pi05.components.paligemma import Pi05PaliGemmaExpert
 from mstar.model.pi05.components.siglip import Pi05SiglipEncoder
 from mstar.model.pi05.components.tokenization import Pi05Tokenizer
 from mstar.model.pi05.config import (
+    CHUNK_WALK,
     LLM_ATTN,
     LLM_KV,
+    LLM_NODES,
     LLM_POS,
     Pi05Config,
     load_pi05_config,
 )
-from mstar.model.pi05.submodules import Pi05LLMSubmodule, Pi05ViTEncoderSubmodule
+from mstar.model.pi05.submodules import Pi05ActionSubmodule, Pi05LLMSubmodule, Pi05ViTEncoderSubmodule
 from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
@@ -152,8 +147,7 @@ class Pi05Model(Model):
     # load_image is a PNG decode per camera, and only that
     PREPROCESS_PARALLEL_IMAGES = True
 
-    PREFILL_WALK = "prefill"
-    ACTION_GEN_WALK = "action_gen"
+    CHUNK_WALK = CHUNK_WALK
 
     def __init__(
         self,
@@ -417,9 +411,8 @@ class Pi05Model(Model):
         """LLM paged KV + attention/position. vit_encoder is stateless.
 
         No sampler: actions come from flow matching, not token sampling. The
-        action expert shares this KV cache with PaliGemma (same head dims), and
-        ``action_gen`` reads the frozen prefix read-only via ``KVStep(commit=
-        False)`` while ``prefill`` commits it.
+        action expert shares this KV cache with PaliGemma (same head dims),
+        reading the frozen prefix via ``KVStep(commit=False)``.
         """
         kv_config = PagedKVConfig(
             num_layers=self.config.num_layers,
@@ -429,16 +422,31 @@ class Pi05Model(Model):
             num_qo_heads=self.config.num_qo_heads,
         )
         return [
-            KVSpec(resource_key=LLM_KV, nodes={"LLM"}, config=kv_config),
+            KVSpec(resource_key=LLM_KV, nodes=set(LLM_NODES), config=kv_config, leader="LLM"),
             AttentionSpec(
-                resource_key=LLM_ATTN, nodes={"LLM"},
+                resource_key=LLM_ATTN, nodes=set(LLM_NODES),
                 config=AttentionConfig(kv_cache=LLM_KV),
             ),
             PositionSpec(
-                resource_key=LLM_POS, nodes={"LLM"},
+                resource_key=LLM_POS, nodes=set(LLM_NODES),
                 config=PositionConfig(kv_cache=LLM_KV),
             ),
         ]
+
+    def validate_config_yaml(self, config: dict, config_path: str) -> None:
+        """Both experts need one KV cache's worth of memory: placed apart, the
+        action expert would attend over an empty prefix and answer without error."""
+        ranks = {
+            node: group.get("ranks")
+            for group in config.get("node_groups", [])
+            for node in group.get("node_names", [])
+            if node in LLM_NODES
+        }
+        if len(ranks) == len(LLM_NODES) and len({tuple(r or ()) for r in ranks.values()}) > 1:
+            raise ValueError(
+                f"{config_path}: node_groups must place {' and '.join(LLM_NODES)} on the "
+                f"same ranks, since they share a KV cache; got {ranks}"
+            )
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # Pi0.5 encodes the robot state as a decimal-string suffix on the
@@ -447,7 +455,10 @@ class Pi05Model(Model):
         # tokenizer. So the model only ever sees a single "text_inputs"
         # stream — there are no separate state-bin tokens. This matches
         # lerobot's processor_pi05.Pi05PrepareStateTokenizerProcessorStep.
-        prefill = Sequential(
+        # One walk, so the action step follows the prefix KV write on the worker
+        # with no round trip through the conductor. ``prefix_done`` only orders
+        # the two: the action step reads the prefix through the shared KV.
+        chunk = Sequential(
             [
                 GraphNode(
                     name="vit_encoder",
@@ -457,30 +468,24 @@ class Pi05Model(Model):
                 GraphNode(
                     name="LLM",
                     input_names=["img_emb", "text_inputs"],
-                    outputs=[],
+                    outputs=[GraphEdge(next_node="action_expert", name="prefix_done")],
+                ),
+                GraphNode(
+                    name="action_expert",
+                    input_names=["prefix_done"],
+                    outputs=[
+                        GraphEdge(
+                            next_node=EMIT_TO_CLIENT,
+                            name="actions",
+                            output_modality="action",
+                        ),
+                    ],
                 ),
             ]
         )
 
-        # All num_flow_steps Euler steps run inside one LLM step: the prefix KV
-        # and the action tokens' positions are the same for every step, so one
-        # plan serves the whole loop, and a worker step per Euler step would
-        # cost more host time than the step's GPU work.
-        action_gen = GraphNode(
-            name="LLM",
-            input_names=["noisy_actions"],
-            outputs=[
-                GraphEdge(
-                    next_node=EMIT_TO_CLIENT,
-                    name="actions",
-                    output_modality="action",
-                ),
-            ],
-        )
-
         return {
-            self.PREFILL_WALK: prefill,
-            self.ACTION_GEN_WALK: action_gen,
+            self.CHUNK_WALK: chunk,
         }
 
     # ------------------------------------------------------------------
@@ -546,8 +551,8 @@ class Pi05Model(Model):
         images = cfg.num_cameras * (cfg.vit_image_size // cfg.vit_patch_size) ** 2
         layout = LabelLayout(
             spans=(
-                Span("rows", self.PREFILL_WALK, images, images, "img_emb"),
-                Span("ids", self.PREFILL_WALK, text_ids.numel(), text_ids.numel(), "text_inputs"),
+                Span("rows", self.CHUNK_WALK, images, images, "img_emb"),
+                Span("ids", self.CHUNK_WALK, text_ids.numel(), text_ids.numel(), "text_inputs"),
             ),
             scratch=cfg.action_horizon,
         )
@@ -585,7 +590,7 @@ class Pi05Model(Model):
         full_metadata = CurrentForwardConductorMetadata(
             input_modalities=input_modalities,
             output_modalities=output_modalities,
-            graph_walk=self.PREFILL_WALK,
+            graph_walk=self.CHUNK_WALK,
             is_prefill=True,
             kwargs={},
         )
@@ -605,7 +610,6 @@ class Pi05Model(Model):
             full_metadata=full_metadata,
             inputs=inputs,
             unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": True},
         )
 
     def get_partition_forward_pass_args(
@@ -615,25 +619,11 @@ class Pi05Model(Model):
         persist_signals: dict[str, list[TensorPointerInfo]],
         incoming_connections: list[StreamingConnectionState] | None = None,
     ) -> ForwardPassArgs:
-        metadata = partition_metadata
-        request_done = False
-        inputs: list[GraphEdge] = []
-
-        if metadata.graph_walk == self.PREFILL_WALK:
-            metadata.is_prefill = False
-            metadata.graph_walk = self.ACTION_GEN_WALK
-            # The initial noise is drawn in the LLM submodule's prepare_inputs.
-            inputs = [GraphEdge(next_node="LLM", name="noisy_actions")]
-        elif metadata.graph_walk == self.ACTION_GEN_WALK:
-            request_done = True
-
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
         return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": metadata.is_prefill},
-            request_done=request_done,
+            full_metadata=partition_metadata,
+            inputs=[],
+            unpersist_tensors=[],
+            request_done=True,
         )
 
     # ------------------------------------------------------------------
@@ -676,6 +666,11 @@ class Pi05Model(Model):
             return Pi05LLMSubmodule(
                 embed_tokens=self.embed_tokens,
                 paligemma=self.paligemma,
+                config=self.config,
+            )
+        if node_name == "action_expert":
+            self._init_llm_components(device)
+            return Pi05ActionSubmodule(
                 action_expert=self.action_expert,
                 action_in_proj=self.action_in_proj,
                 action_out_proj=self.action_out_proj,

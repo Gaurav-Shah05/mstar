@@ -18,14 +18,14 @@ max_seq_len: 2048
 #      post-compute Python, so both systems do identical 32-dim work.
 #
 # CUDA-graph note: action_horizon and action_dim are both baked into the
-# graph captures (see Pi05LLMSubmodule.get_cuda_graph_configs in
-# mstar/model/pi05/submodules.py:325-329). They MUST be set at server-init
+# graph captures (see Pi05ActionSubmodule.get_accelerator_graph_configs in
+# mstar/model/pi05/submodules.py). They MUST be set at server-init
 # time, never per-request — that's what this yaml override is for.
 model_kwargs:
   action_horizon: 15
 
 # FlashInfer FA2 rather than the FA3 kernel "auto" picks on SM90 (H100/H200):
-# the captured action_gen step (10 Euler steps of ~15 action queries over the
+# the captured action step (10 Euler steps of ~15 action queries over the
 # ~900-token prefix) 14.0 -> 10.1 ms on an H200, for +0.3 ms of prefill.
 # Elsewhere "auto" already picks FA2.
 resources:
@@ -40,5 +40,6 @@ node_groups:
 
   - node_names:
       - LLM
+      - action_expert
     ranks:
       - 0
