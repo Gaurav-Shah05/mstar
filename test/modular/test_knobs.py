@@ -85,3 +85,21 @@ def test_idle_hold_from_the_config_and_the_environment(monkeypatch):
 def test_a_bad_idle_hold_fails_the_startup_check(value):
     with pytest.raises(ValueError, match="idle_hold"):
         knobs.check({"idle_hold": value})
+
+
+def test_full_cpu_frequency_is_off_until_the_config_or_the_environment_asks(monkeypatch):
+    assert knobs.full_cpu_frequency_enabled() is False
+    knobs.configure({"full_cpu_frequency": True})
+    assert knobs.full_cpu_frequency_enabled() is True
+    monkeypatch.setenv("MSTAR_FULL_CPU_FREQUENCY", "0")
+    assert knobs.full_cpu_frequency_enabled() is False
+    for bad in ("1024", "true"):
+        monkeypatch.setenv("MSTAR_FULL_CPU_FREQUENCY", bad)
+        with pytest.raises(ValueError, match="MSTAR_FULL_CPU_FREQUENCY 1 or 0"):
+            knobs.full_cpu_frequency_enabled()
+
+
+@pytest.mark.parametrize("value", [1024, -1, "max"])
+def test_a_bad_full_cpu_frequency_fails_the_startup_check(value):
+    with pytest.raises(ValueError, match="full_cpu_frequency must be"):
+        knobs.check({"full_cpu_frequency": value})
