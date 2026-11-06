@@ -1,0 +1,144 @@
+diff --git a/mstar/model/media_limits.py b/mstar/model/media_limits.py
+index 71c3a8abd..17112ddf6 100644
+--- a/mstar/model/media_limits.py
++++ b/mstar/model/media_limits.py
+@@ -10,7 +10,9 @@ a request's files inside :class:`RequestMediaBudget`, every check also counts
+ against what the request's other files use, whether finished or still loading.
+ """
+ import os
++import struct
+ import threading
++import zlib
+ from contextlib import contextmanager
+ from contextvars import ContextVar
+ 
+@@ -352,6 +354,35 @@ def check_image_size(filepath: str, formats: tuple[str, ...] = IMAGE_FORMATS) ->
+     return fmt, animated
+ 
+ 
++# Chunks that can sit before a PNG's image data without changing what Pillow
++# reports for it. Any other chunk (tRNS, acTL, ...) goes through Pillow.
++_PLAIN_PNG_CHUNKS = frozenset({b"sRGB", b"gAMA", b"cHRM", b"pHYs", b"tIME", b"tEXt", b"zTXt", b"iTXt"})
++
++
++def _plain_rgb_png_size(filepath: str) -> tuple[int, int] | None:
++    """Width and height of an ordinary 8-bit RGB PNG, read straight from its
++    header. ``None`` for anything else, including any malformed file, which is
++    left for Pillow to judge. ``Image.open`` costs about 0.4 ms with the GIL
++    held, which a request's camera frames would pay in series even when their
++    decodes overlap."""
++    with open(filepath, "rb") as f:
++        head = f.read(4096)
++    if head[:16] != b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR" or len(head) < 41:
++        return None
++    width, height, depth, color, compression, filtering, interlace, crc = struct.unpack(">IIBBBBBI", head[16:33])
++    if (depth, color, compression, filtering, interlace) != (8, 2, 0, 0, 0) or zlib.crc32(head[12:29]) != crc:
++        return None
++    offset = 33
++    while offset + 8 <= len(head):
++        length, kind = struct.unpack(">I4s", head[offset:offset + 8])
++        if kind == b"IDAT":
++            return width, height
++        if kind not in _PLAIN_PNG_CHUNKS:
++            return None
++        offset += length + 12
++    return None
++
++
+ def _check_image_header(filepath: str, formats: tuple[str, ...]) -> tuple[str, bool, str, bool]:
+     """:func:`check_image_size`, plus Pillow's mode and whether the file
+     carries transparency (an alpha channel or a tRNS or GIF transparent color)."""
+@@ -360,6 +391,14 @@ def _check_image_header(filepath: str, formats: tuple[str, ...]) -> tuple[str, b
+     from PIL import Image, UnidentifiedImageError
+ 
+     limit = max_image_pixels()
++    if "PNG" in formats:
++        try:
++            size = _plain_rgb_png_size(filepath)
++        except OSError:
++            size = None
++        if size is not None and 0 < size[0] * size[1] <= limit:
++            _charge_request("image", size[0] * size[1])
++            return "PNG", False, "RGB", False
+     try:
+         with warnings.catch_warnings():
+             warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+diff --git a/test/modular/test_plain_png_header.py b/test/modular/test_plain_png_header.py
+new file mode 100644
+index 000000000..3c0c54345
+--- /dev/null
++++ b/test/modular/test_plain_png_header.py
+@@ -0,0 +1,73 @@
++"""The plain-PNG shortcut in the image header check answers as Pillow does."""
++import numpy as np
++import pytest
++from PIL import Image, PngImagePlugin
++
++from mstar.model import media_limits
++from mstar.model.media_limits import IMAGE_FORMATS, _check_image_header, _plain_rgb_png_size
++
++
++def _pillow_answer(path):
++    with Image.open(path, formats=IMAGE_FORMATS) as image:
++        return (image.format, bool(getattr(image, "is_animated", False)), image.mode, bool(image.has_transparency_data))
++
++
++def _save(path, mode, **kwargs):
++    shape = {"RGB": (12, 16, 3), "RGBA": (12, 16, 4), "L": (12, 16), "P": (12, 16)}[mode]
++    data = np.arange(np.prod(shape), dtype=np.uint8).reshape(shape) % 200
++    Image.fromarray(data).convert(mode).save(path, format="PNG", **kwargs)
++    return str(path)
++
++
++def test_plain_rgb_takes_the_shortcut_and_matches_pillow(tmp_path):
++    path = _save(tmp_path / "a.png", "RGB")
++    assert _plain_rgb_png_size(path) == (16, 12)
++    assert _check_image_header(path, IMAGE_FORMATS) == _pillow_answer(path)
++
++
++def test_text_chunk_keeps_the_shortcut(tmp_path):
++    info = PngImagePlugin.PngInfo()
++    info.add_text("camera", "wrist")
++    path = _save(tmp_path / "a.png", "RGB", pnginfo=info)
++    assert _plain_rgb_png_size(path) == (16, 12)
++
++
++@pytest.mark.parametrize(
++    ("mode", "kwargs"),
++    [("RGBA", {}), ("L", {}), ("P", {}), ("RGB", {"transparency": (1, 2, 3)}), ("RGB", {"icc_profile": b"\0" * 128})],
++)
++def test_anything_else_goes_through_pillow(tmp_path, mode, kwargs):
++    path = _save(tmp_path / "a.png", mode, **kwargs)
++    assert _plain_rgb_png_size(path) is None
++    assert _check_image_header(path, IMAGE_FORMATS) == _pillow_answer(path)
++
++
++def test_animated_png_goes_through_pillow(tmp_path):
++    frames = [Image.new("RGB", (8, 8), (i, 0, 0)) for i in (0, 90)]
++    path = str(tmp_path / "a.png")
++    frames[0].save(path, format="PNG", save_all=True, append_images=frames[1:])
++    assert _plain_rgb_png_size(path) is None
++    assert _check_image_header(path, IMAGE_FORMATS)[1] is True
++
++
++def test_corrupt_ihdr_is_refused_as_before(tmp_path):
++    path = _save(tmp_path / "a.png", "RGB")
++    data = bytearray(open(path, "rb").read())
++    data[17] ^= 0xFF  # width, leaving the CRC wrong
++    open(path, "wb").write(data)
++    assert _plain_rgb_png_size(path) is None
++    with pytest.raises(ValueError, match="not in a format"):
++        _check_image_header(path, IMAGE_FORMATS)
++
++
++def test_format_list_without_png_refuses_a_png(tmp_path):
++    path = _save(tmp_path / "a.png", "RGB")
++    with pytest.raises(ValueError, match="not in a format"):
++        _check_image_header(path, ("JPEG",))
++
++
++def test_size_limit_applies_on_the_shortcut(tmp_path, monkeypatch):
++    path = _save(tmp_path / "a.png", "RGB")
++    monkeypatch.setattr(media_limits, "max_image_pixels", lambda: 100)
++    with pytest.raises(ValueError, match="the limit is 100 pixels"):
++        _check_image_header(path, IMAGE_FORMATS)

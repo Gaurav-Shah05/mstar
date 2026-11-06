@@ -52,6 +52,8 @@ Base: run-base e8826a777. GPU: 1x H200. Headline: action-chunk latency p50 at c=
 
 ## Hypothesis queue (ordered by expected gain)
 
+- Queued after checkpoint 5 (chain19.sh), sequential protocol on 3c4fdfa9a: H29 = H22 plain-PNG header (h29.patch; microbench 0.428 -> 0.015 ms per image, GIL-held; expected about -1 ms); H30 = H21 conductor poll, main's 2394b4d46 #1074 (h30.patch; expected under 1 ms). Both failed only under the paired harness; re-measured because that harness hid 2-4 ms for H28. Terms: literal keep rule.
+
 - AUDIT done: H9 and H5 both passed the literal rule. Qwen3.5 A/B of H20 (other_model_h20.sh) queued; chain8.sh had not been running.
 - P1 concurrent decode: KEPT (0d887ae5e, aeda84155), -1.6 ms.
 - H23 decode pool sized for the cameras: KEPT (833bc8acb, 3444a8779), about -1 ms.
