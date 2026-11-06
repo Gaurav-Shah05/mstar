@@ -29,6 +29,11 @@ model_kwargs:
       q99: [0.4476, 0.7652000000000001, 0.4480000000000002, 0.7944, 0.6484000000000001, 0.6628000000000001,
             0.7344000000000002, 0.9998]
 
+# FA2, not the FA3 kernel "auto" picks on SM90: faster for the action step's few queries over a long prefix.
+resources:
+  attn:
+    flashinfer_backend: fa2
+
 node_groups:
   - node_names:
       - vit_encoder

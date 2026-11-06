@@ -1,6 +1,11 @@
 model: "pi05"
 max_seq_len: 2048
 
+# FA2, not the FA3 kernel "auto" picks on SM90: faster for the action step's few queries over a long prefix.
+resources:
+  attn:
+    flashinfer_backend: fa2
+
 node_groups:
   - node_names:
       - vit_encoder
