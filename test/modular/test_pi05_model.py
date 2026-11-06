@@ -879,6 +879,13 @@ def test_pi05_droid_config_serves_the_droid_checkpoint_with_its_stats():
     assert model.norm_stats.actions.q01.numel() == model.norm_stats.actions.q99.numel() == 8
 
 
+def test_pi05_prefill_buckets_hold_whole_requests():
+    config = _make_model().config
+    llm = Pi05LLMSubmodule(None, None, config)
+    longest = config.num_cameras * config.tokens_per_image + config.max_lang_tokens
+    assert llm._prefill_token_buckets() == [512, longest, 2 * longest, 4 * longest]
+
+
 def test_pi05_refuses_experts_on_different_ranks():
     groups = [{"node_names": ["LLM"], "ranks": [0]}, {"node_names": ["action_expert"], "ranks": [1]}]
     with pytest.raises(ValueError, match="same ranks"):
