@@ -45,6 +45,13 @@ class ChunkRange(NamedTuple):
         return self.end >= self.total
 
 
+class BucketCut(NamedTuple):
+    """A walk's captured token counts, ascending, and the fewest padded tokens
+    that make a cut at one of them worth a step of its own."""
+    counts: tuple[int, ...]
+    min_saved: int
+
+
 class ChunkingManagement:
     def __init__(self, submodules: Mapping[str, "SubmoduleManagement"]):
         # the engine's own mapping, which it fills as it loads nodes
@@ -60,6 +67,8 @@ class ChunkingManagement:
         self._override_mixed: frozenset[str] = frozenset()
         # (node, combined walk) -> walk -> the cap on that walk's rows in a step
         self._walk_caps: dict[tuple[str, str], dict[str, int] | None] = {}
+        # (node, walk) -> the step's capture ladder and cut threshold
+        self._bucket_cuts: dict[tuple[str, str], BucketCut | None] = {}
         # (node, walk) -> steps that ran over the budget they were scheduled under
         self._overruns: dict[tuple[str, str], int] = {}
         # nodes the worker chunks nowhere, whatever the model declares
@@ -136,6 +145,7 @@ class ChunkingManagement:
         self._combined_walk_of = dict(combined_walk_of or {})
         self._override_mixed = frozenset(override_mixed)
         self._walk_caps = {}
+        self._bucket_cuts = {}
         combined_walks = {(node, combined) for (node, _), combined in self._combined_walk_of.items()}
         for node, setting in overrides.items():
             if node not in self._submodules:
@@ -183,6 +193,26 @@ class ChunkingManagement:
                 } or None
             self._walk_caps[key] = caps
         return self._walk_caps[key]
+
+    def bucket_cut(self, node_name: str, graph_walk: str) -> BucketCut | None:
+        """What the scheduler needs to cut a step of ``graph_walk`` at a capture
+        bucket, or None where no walk asks for it or it replays no capture. Asked
+        once a step is built, so after capture. A combined walk answers for the
+        walk inside it that asks, since a step of that walk's rows alone replays
+        that walk's ladder."""
+        key = (node_name, graph_walk)
+        if key not in self._bucket_cuts:
+            walks = [w for (n, w), c in self._combined_walk_of.items() if n == node_name and c == graph_walk]
+            cut = None
+            for walk in walks or [graph_walk]:
+                min_saved = self.policy(node_name, walk).bucket_cut_min_saved
+                runner = self._submodules[node_name].accelerator_graph_runner
+                if min_saved is not None and runner is not None:
+                    counts = runner.captured_token_counts(walk)
+                    cut = BucketCut(counts, min_saved) if counts else None
+                    break
+            self._bucket_cuts[key] = cut
+        return self._bucket_cuts[key]
 
     def chunkable(self, node_name: str, graph_walk: str) -> bool:
         """The submodule's say, unless the serving config turned the walk's

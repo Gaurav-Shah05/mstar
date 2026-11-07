@@ -9,12 +9,14 @@ queues (``build_batch``).
 """
 
 from abc import ABC, abstractmethod
+from bisect import bisect_left
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
+    from mstar.engine.chunking import BucketCut
     from mstar.worker.micro_scheduler import ScheduledBatch
 
 
@@ -101,6 +103,7 @@ class BatchBuildRequest:
     min_chunk_tokens: int = 1
     # Rows already mid-prefill -> when their first chunk was cut; lower is older.
     start_order: dict[int, int] = field(default_factory=dict)
+    bucket_cut: "BucketCut | None" = None
 
 
 class BatchBuildResult(NamedTuple):
@@ -309,16 +312,23 @@ class FIFOBatchBuilder(BaseBatchBuilder):
         if request.max_batch_tokens is None:
             return BatchBuildResult(scheduled, backlog=remainder, returned=returned)
 
-        take, dropped = self.share_token_budget(
-            list(scheduled.request_to_worker_graph), request.row_tokens,
-            request.chunkable, request.max_batch_tokens, request.min_chunk_tokens,
-            request.start_order,
-        )
-        if request.walk_max_tokens:
-            _cap_walks(
-                scheduled, take, dropped, request.chunkable, request.walk_max_tokens,
-                self.share_token_budget, request.min_chunk_tokens, request.start_order,
+        def share(budget: int) -> tuple[dict[int, int], set[int]]:
+            take, dropped = self.share_token_budget(
+                list(scheduled.request_to_worker_graph), request.row_tokens,
+                request.chunkable, budget, request.min_chunk_tokens,
+                request.start_order,
             )
+            if request.walk_max_tokens:
+                _cap_walks(
+                    scheduled, take, dropped, request.chunkable, request.walk_max_tokens,
+                    self.share_token_budget, request.min_chunk_tokens, request.start_order,
+                )
+            return take, dropped
+
+        take, dropped = share(request.max_batch_tokens)
+        lower = cut_budget(take, request.chunkable, request.bucket_cut) if request.bucket_cut else None
+        if lower is not None:
+            take, dropped = share(lower)
         chunk_tokens = {
             rid: n for rid, n in take.items() if n < request.row_tokens.get(rid, n)
         }
@@ -473,6 +483,27 @@ def fill_token_budget(
             dropped.add(rid)
     _run_head(rids, tokens, chunkable, budget, min_chunk, take, dropped)
     return take, dropped
+
+
+def cut_budget(take: dict[int, int], chunkable: set[int], cut: "BucketCut") -> int | None:
+    """The capture bucket below a step to share out as its budget instead, when
+    the padding that avoids, net of the bucket the rest then pads to, is at least
+    ``cut.min_saved`` tokens; else None. Only a step of chunkable rows cuts: beside
+    decode rows the prompt's extra step costs more TTFT than the padding saves.
+    ``cut.counts`` is the walk's at any batch size, so where the lower bucket isn't
+    captured at this step's batch size it replays a larger one, and pays for the
+    second step without saving that padding."""
+    if not chunkable.issuperset(take):
+        return None
+    total = sum(take.values())
+    above = bisect_left(cut.counts, total)
+    if above == 0 or above == len(cut.counts) or cut.counts[above] == total:
+        return None
+    lower = cut.counts[above - 1]
+    rest = bisect_left(cut.counts, total - lower)
+    if cut.counts[above] - lower - cut.counts[rest] < cut.min_saved:
+        return None
+    return lower
 
 
 def _cap_walks(

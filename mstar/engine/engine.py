@@ -24,7 +24,7 @@ from mstar.engine.accelerator_graph_runner import (
     fail_if_graphs_required,
     plan_captures,
 )
-from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS, ChunkingManagement, ChunkRange
+from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS, BucketCut, ChunkingManagement, ChunkRange
 from mstar.engine.fp32_precision import Fp32Precision, cudnn_benchmark, fp32_precision_scope, node_fp32_precision
 from mstar.engine.node_dtype import resolve_node_dtype
 from mstar.engine.resources import (
@@ -2765,6 +2765,9 @@ class Engine:
 
     def get_max_batch_tokens(self, node_name: str, graph_walk: str) -> int | None:
         return self._chunking.max_batch_tokens(node_name, graph_walk)
+
+    def bucket_cut(self, node_name: str, graph_walk: str) -> BucketCut | None:
+        return self._chunking.bucket_cut(node_name, graph_walk)
 
     def set_token_budgets(
         self, overrides: Mapping[str, Any], walks: set[str],

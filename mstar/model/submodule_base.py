@@ -543,6 +543,11 @@ class ChunkingPolicy:
     # whether a row may start past its cached prefix, asked before prepare; None is always
     reuses_cached_prefix: Callable[[CurrentForwardPassInfo], bool] | None = None
     reserve_whole_prefill: bool = True
+    # A step pads to its capture bucket, so one just past a bucket pays for the
+    # next one up. The fewest padded tokens that make it worth cutting a prompt
+    # at the lower bucket and running the rest in a step of its own, against
+    # the cost of that step, which is the model's (None never cuts for this).
+    bucket_cut_min_saved: int | None = None
 
     def __post_init__(self):
         both = self.accumulated_outputs & self.per_chunk_outputs
@@ -550,6 +555,9 @@ class ChunkingPolicy:
             raise ValueError(
                 f"outputs {sorted(both)} are both gathered and sent per chunk; name each in one"
             )
+        saved = self.bucket_cut_min_saved
+        if saved is not None and (isinstance(saved, bool) or not isinstance(saved, int) or saved < 1):
+            raise ValueError(f"bucket_cut_min_saved must be a positive token count, got {saved!r}")
 
 
 NO_CHUNKING = ChunkingPolicy()

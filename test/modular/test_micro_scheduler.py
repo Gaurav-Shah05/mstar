@@ -290,6 +290,9 @@ class _Engine:
         del node_name, graph_walk
         return True
 
+    def bucket_cut(self, node_name, graph_walk):
+        return None
+
     def get_max_batch_tokens(self, node_name, graph_walk):
         del node_name, graph_walk
 

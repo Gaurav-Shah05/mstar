@@ -1625,6 +1625,10 @@ and ends at the prompt's length. To opt a walk in:
   - ``reuses_cached_prefix``: a callable saying whether a row may start past its cached
     prefix; ``None`` (the default) is always. Set it where a row may have to write its
     prefix again.
+  - ``bucket_cut_min_saved`` (default off): a step of chunkable prompts alone, just past
+    a capture bucket, shares that bucket as its budget when that avoids at least this
+    many padded tokens, net of the bucket the rest pads to. It pays where prefill is
+    compute-bound, and costs throughput where a second step costs more than the padding.
   - ``reserve_whole_prefill`` (default on): a row's first chunk reserves the state its
     whole prefill needs, so a part-done row cannot wedge on a full pool. Turn it off for
     a walk whose state grows by something other than the tokens a step runs.
