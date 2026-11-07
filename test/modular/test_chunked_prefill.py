@@ -11,11 +11,12 @@ from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
+import pytest
 import torch
 
-from mstar.engine.chunking import ChunkRange
+from mstar.engine.chunking import BucketCut, ChunkingManagement, ChunkRange
 from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
-from mstar.worker.batch_builder import fill_token_budget, fill_token_budget_in_start_order
+from mstar.worker.batch_builder import cut_budget, fill_token_budget, fill_token_budget_in_start_order
 
 # ── the token budget ────────────────────────────────────────────────────
 
@@ -786,3 +787,72 @@ def test_a_chunked_walk_that_reports_no_row_length_is_refused():
 
     with pytest.raises(ValueError, match="get_input_sequence_len"):
         _unchunkable_nodes({"LLM": _Unmeasured()}, _chunking_model(), _groups())
+
+
+class TestCutToBucket:
+    CUT = BucketCut((32, 64, 128, 256, 512, 1024, 2048, 2176), 512)
+
+    def test_a_lone_prompt_just_past_a_bucket_cuts_to_it(self):
+        assert cut_budget({1: 1034}, {1}, self.CUT) == 1024, "1024 + 32 saves 992 padded tokens over 2048"
+
+    def test_a_step_with_decode_rows_stays_whole(self):
+        assert cut_budget({1: 1034, 2: 1, 3: 1}, {1}, self.CUT) is None, "rows 2 and 3 can't be cut"
+
+    def test_several_prompts_cut_at_the_same_bucket(self):
+        assert cut_budget({1: 700, 2: 334}, {1, 2}, self.CUT) == 1024, "the total decides, not a row"
+
+    def test_a_step_on_a_bucket_stays(self):
+        assert cut_budget({1: 1024}, {1}, self.CUT) is None, "no padding to avoid"
+
+    def test_a_small_saving_stays_whole(self):
+        assert cut_budget({1: 300}, {1}, self.CUT) is None, "300 pads to 512; 256 + 64 saves only 192"
+
+    def test_a_rest_that_pads_as_far_stays_whole(self):
+        assert cut_budget({1: 1900}, {1}, self.CUT) is None, "1900 pads to 2048; 1024 + 1024 saves nothing"
+
+    def test_nothing_chunkable_stays(self):
+        assert cut_budget({1: 1034}, set(), self.CUT) is None, "no row may be cut"
+
+    def test_a_step_past_the_top_bucket_stays(self):
+        assert cut_budget({1: 4000}, {1}, self.CUT) is None, "no bucket above it to avoid"
+
+
+def test_captured_token_counts_read_the_walks_buckets():
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner, BucketKey
+
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    held = SimpleNamespace(slots=[0], config=SimpleNamespace(total_tokens_multiplier=2))
+    runner._buckets = {
+        BucketKey(graph_walk="a", cg_key_info=None, bs=1, num_tokens=128): held,
+        BucketKey(graph_walk="a", cg_key_info=None, bs=4, num_tokens=128): held,
+        BucketKey(graph_walk="a", cg_key_info=None, bs=1, num_tokens=64): held,
+        BucketKey(graph_walk="a", cg_key_info=None, bs=1, num_tokens=256): SimpleNamespace(
+            slots=[], config=held.config,
+        ),
+        BucketKey(graph_walk="b", cg_key_info=None, bs=1, num_tokens=512): held,
+    }
+    assert runner.captured_token_counts("a") == (32, 64)
+
+
+def test_a_combined_walk_answers_a_bucket_cut_from_the_walk_that_asks():
+    calls = []
+    runner = SimpleNamespace(captured_token_counts=lambda walk: calls.append(walk) or (64, 128))
+    chunking = ChunkingManagement({"n": SimpleNamespace(accelerator_graph_runner=runner)})
+    chunking.set_policies({
+        ("n", "prompt"): ChunkingPolicy(walks=("prompt",), chunkable=True, bucket_cut_min_saved=512),
+        ("n", "mixed"): ChunkingPolicy(walks=("mixed",)),
+        ("n", "alone"): ChunkingPolicy(walks=("alone",), chunkable=True, bucket_cut_min_saved=256),
+    })
+    chunking.set_budgets({}, {"prompt", "decode", "mixed", "alone", "off"},
+                         combined_walk_of={("n", "prompt"): "mixed", ("n", "decode"): "mixed"})
+    assert chunking.bucket_cut("n", "mixed") == BucketCut((64, 128), 512)
+    assert chunking.bucket_cut("n", "mixed") == BucketCut((64, 128), 512)
+    assert chunking.bucket_cut("n", "alone") == BucketCut((64, 128), 256)
+    assert chunking.bucket_cut("n", "off") is None
+    assert calls == ["prompt", "alone"]
+
+
+@pytest.mark.parametrize("bad", [0, -1, True, 512.0, "512"])
+def test_a_bad_bucket_cut_is_refused(bad):
+    with pytest.raises(ValueError, match="bucket_cut_min_saved"):
+        ChunkingPolicy(bucket_cut_min_saved=bad)

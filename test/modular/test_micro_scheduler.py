@@ -20,7 +20,7 @@ sys.path.insert(0, ".")
 
 import pytest
 
-from mstar.engine.chunking import ChunkingManagement, ChunkRange
+from mstar.engine.chunking import BucketCut, ChunkingManagement, ChunkRange
 from mstar.engine.resources.step import (
     FULL_ADMIT_NOT_READY,
     FULL_ADMIT_OK,
@@ -1632,6 +1632,58 @@ def test_returned_rows_go_back_to_their_ready_queue_not_the_backlog():
 
     assert not sched.backlog
     assert set(manager.queues["wg0"].get_ready_node_names()) == {"r1", "r3"}
+
+
+def _cut_step(builder, tokens, start_order=None, min_chunk=128):
+    rids = list(tokens)
+    return builder.build_batch(BatchBuildRequest(
+        node_name=NODE, graph_walk=WALK,
+        fresh=_batch(rids),
+        pick=builder.pick(StepCandidates(graph_walk=WALK, queued=rids)),
+        max_batch_tokens=2048,
+        row_tokens=tokens,
+        chunkable=set(rids),
+        min_chunk_tokens=min_chunk,
+        start_order=start_order or {},
+        bucket_cut=BucketCut((32, 64, 128, 256, 512, 1024, 2048), 512),
+    ))
+
+
+def test_the_builder_cuts_at_a_bucket():
+    assert _cut_step(FIFOBatchBuilder(), {"r": 1034}).chunk_tokens == {"r": 1024}
+
+
+def test_a_bucket_cut_gives_up_tokens_in_the_builders_start_order():
+    """The fresh prompt finishes and the one already mid-prefill takes what is
+    left, as under any budget, though the fresh prompt is the longer."""
+    result = _cut_step(FIFOBatchBuilder(), {"old": 550, "new": 600}, start_order={"old": 0})
+    assert result.chunk_tokens == {"old": 424}
+
+
+def test_a_bucket_cut_keeps_the_oldest_rows_floor():
+    """The fresh prompt would fill the bucket but for the oldest row's floor."""
+    result = _cut_step(FIFOBatchBuilder(), {"old": 600, "new": 896}, start_order={"old": 0})
+    assert result.chunk_tokens == {"old": 128}
+
+
+@pytest.mark.parametrize("chain_rows, asks", [(0, True), (2, False)])
+def test_a_speculation_chain_beside_the_row_stops_the_bucket_cut(chain_rows, asks):
+    cut = BucketCut((32, 1024, 2048), 512)
+    engine = SimpleNamespace(
+        get_max_batch_tokens=lambda *_: 2048, min_chunk_tokens=lambda budget: 64,
+        walk_token_caps=lambda *_: None, bucket_cut=lambda *_: cut,
+    )
+    scheduler = MicroScheduler.__new__(MicroScheduler)
+    scheduler.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
+    scheduler._mid_prefill_rows = lambda *_: (None, {})
+    scheduler._measure_rows = lambda *_: ({"r": 1034}, {"r"})
+    scheduler._build_and_schedule = lambda request, *_: request
+    builder = FIFOBatchBuilder()
+    request = scheduler._build_step(
+        None, (NODE, WALK), None, _batch(["r"]), builder.pick(StepCandidates(graph_walk=WALK, queued=["r"])),
+        pre_existing_batch_size=chain_rows, pre_existing_seq_lens=lambda: [1] * chain_rows,
+    )
+    assert request.bucket_cut is (cut if asks else None)
 
 
 def test_fifo_puts_the_backlog_ahead_of_fresh_rows():
