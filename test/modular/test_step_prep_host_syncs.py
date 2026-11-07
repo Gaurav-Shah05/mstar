@@ -737,7 +737,6 @@ def _qwen3_omni_thinker(device: torch.device):
            config.thinker.vision_end_token_id, config.im_start_token_id, config.assistant_token_id)
     embed = nn.Embedding(max(config.thinker_text.vocab_size, *ids) + 1, 8, device=device)
     thinker.model = SimpleNamespace(model=SimpleNamespace(embed_tokens=embed))
-    thinker._audio_bos_embed = thinker._audio_eos_embed = None
     thinker._vision_bos_embed = thinker._vision_eos_embed = None
     thinker.__dict__["_cached_device"] = device
     thinker.node_resources = {THINKER_POS: SimpleNamespace(position=lambda rid, label: 5)}
@@ -774,9 +773,8 @@ def test_qwen3_omni_thinker_prefill_prep_writes_no_scalar():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="sync-debug mode needs a GPU")
 def test_qwen3_omni_thinker_audio_prep_takes_no_host_sync():
-    """An audio row prepares with no host sync once the sentinel embeddings
-    exist (the first call builds them). An image row reads its grid on the
-    host, so it is covered by the CPU test above only."""
+    """An audio row prepares with no host sync after a warm call. An image row
+    reads its grid on the host, so only the CPU test above covers it."""
     device = torch.device("cuda")
     thinker = _qwen3_omni_thinker(device)
     walk, inputs = _qwen3_omni_prefill_rows(device)[0]
