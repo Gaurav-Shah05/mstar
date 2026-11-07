@@ -321,9 +321,12 @@ Qwen3.5-0.8B tok/s at c=1 / 8, `benchmark.runner` at `-O2`, the server `taskset`
 | 2x B300, Xeon 6767P (SMT, an L2 per core, C6 170 µs) | 548 / 3939 | 526 / 3851 | 808 / 5670 | c=1: no pin 906, three cores 935, `siblings` 753 |
 | 2x B300, Xeon 6740E (no SMT, four cores to an L2 cluster, C6S 270 µs) | 371 / 2688 | not measured | 527 / 3635 (two cores of a cluster) | 636 / 4251, no pin |
 | H100 VM without deep idle states (a handoff 22 µs) | 529 (c=1) / 6520 (c=16) | not measured | 419 / 5526 (an earlier `auto`, the same layout) | not measured |
-| H200, 2-socket AMD EPYC (C2 800 µs), 16-CPU mask | 634 / 3617 | not measured | 506 / 3103 (an earlier `auto`, the same layout) | not measured |
+| H200, 2-socket AMD EPYC (C2 800 µs), 16-CPU mask, measured earlier | 634 / 3617 | not measured | 506 / 3103 (an earlier `auto`, the same layout) | not measured |
+| H200, 2-socket EPYC 9554 (C2 800 µs), 16-CPU mask, `--rust-frontend`, `-O1`, c=1 / 16 | 442 / 4249 | not measured | 919 / 8444 | 865 / 8151, no pin |
 
-The last column is a `SCHED_IDLE` spinner on each server CPU, a stand-in for `idle_hold: qos` where the device is hidden: the hold itself has not been measured. With the cores held awake, `siblings` loses to no pin and three separate cores are level with it, so `auto` names the hold first when it is set.
+The last column is a `SCHED_IDLE` spinner on each server CPU, a stand-in for `idle_hold: qos` where the device is hidden: the hold itself has not been measured. With the 6767P's cores held awake, `siblings` loses to no pin and three separate cores are level with it, so `auto` names the hold first when it is set.
+
+`configs/qwen3_5_{0.8b,2b,9b}.yaml` set `step_thread_core: siblings`, measured on the EPYC 9554. `mstar serve` uses the Python frontend unless `--rust-frontend` is passed, and a faster worker can saturate it: with `siblings`, 0.8B at c=64 went from 81 to about 940 ms to first token there, against 24 ms on the Rust frontend.
 
 Pinning has other costs. `siblings` on the 6740E raised 0.8B's time to first token at high concurrency (c=64 67 → 86 ms) while raising its throughput, and FLUX.2 klein at c=1 lost about 12% there (c=8 level). A low-duty model with eager host work can leave it `off`.
 

@@ -822,16 +822,26 @@ to 8 cores (with their siblings where the CPU has SMT), medians over server sess
      - not measured
      - 419 / 5526 (an earlier ``auto``, the same layout)
      - not measured
-   * - H200, 2-socket AMD EPYC (C2 800 µs), 16-CPU mask
+   * - H200, 2-socket AMD EPYC (C2 800 µs), 16-CPU mask, measured earlier
      - 634 / 3617
      - not measured
      - 506 / 3103 (an earlier ``auto``, the same layout)
      - not measured
+   * - H200, 2-socket EPYC 9554 (C2 800 µs), 16-CPU mask, ``--rust-frontend``, ``-O1``, c=1 / 16
+     - 442 / 4249
+     - not measured
+     - 919 / 8444
+     - 865 / 8151, no pin
 
 The last column is a ``SCHED_IDLE`` spinner on each server CPU, a stand-in for
 ``idle_hold: qos`` where the device is hidden: the hold itself has not been measured.
-With the cores held awake, ``siblings`` loses to no pin and three separate cores are
-level with it, so ``auto`` names the hold first when it is set.
+With the 6767P's cores held awake, ``siblings`` loses to no pin and three separate cores
+are level with it, so ``auto`` names the hold first when it is set.
+
+``configs/qwen3_5_{0.8b,2b,9b}.yaml`` set ``step_thread_core: siblings``, measured on the
+EPYC 9554. ``mstar serve`` uses the Python frontend unless ``--rust-frontend`` is passed,
+and a faster worker can saturate it: with ``siblings``, 0.8B at c=64 went from 81 to about
+940 ms to first token there, against 24 ms on the Rust frontend.
 
 Pinning has other costs. ``siblings`` on the 6740E raised 0.8B's time to first token
 at high concurrency (c=64 67 → 86 ms) while raising its throughput, and FLUX.2 klein
