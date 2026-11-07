@@ -1,4 +1,4 @@
-READY
+IN PROGRESS: amendment of Nov 7, split into two branches; numbers below are from the earlier head 6bfc962 and will be replaced
 
 Read first: the 9B correctness gate misses its bar on most sets, on main as well as on the PR (section 6). Concept 1's 2x reading is against main's slow mode, and main isn't always in it (section 4). Python-frontend TTFT at c=64 gets about 12x worse (concept 1).
 
