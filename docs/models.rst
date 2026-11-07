@@ -448,7 +448,7 @@ default, which lowers the token count of short clips. Notes:
   LLM: 9B on 2xH200 with TP-async on, DP2 gave 12.5-44% more output tok/s on
   30 s and 60 s videos at c=16 and c=32.
 - A long video is one wide prefill: one 1-3 minute video is ~11-12k tokens,
-  beyond the largest captured ``prefill_vision`` bucket (4096), so it runs
+  beyond the largest captured ``prefill_vision`` bucket (8192), so it runs
   eagerly.
 - Size the KV pool for video. ``configs/qwen3_5_*.yaml`` keep the default
   2048 pages of 128 tokens (262k tokens per deployment); 32 concurrent long
