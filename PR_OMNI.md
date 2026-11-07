@@ -1,4 +1,4 @@
-READY
+IN PROGRESS: amendment of Nov 7 — splitting into perf/rp4-pr-gather + perf/rp4-pr-omni, review fixes, re-measuring
 
 # PR facts: Qwen3-Omni
 
