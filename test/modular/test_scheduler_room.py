@@ -79,6 +79,9 @@ class _Engine:
         self.varies = set(varies)  # the walks whose cap moves
         self.asked = 0
 
+    def get_gather_policy(self, node_name, graph_walk):
+        return None
+
     def get_max_batch_size(self, node_name, graph_walk):
         self.asked += 1
         return self.max_bs.get(graph_walk) if isinstance(self.max_bs, dict) else self.max_bs

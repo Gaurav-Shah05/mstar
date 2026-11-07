@@ -509,6 +509,19 @@ def _split_pos_ids(
 
 
 @dataclass(frozen=True)
+class GatherPolicy:
+    """Let a node's ready rows gather before they take a step of their own.
+
+    While the worker holds at least ``busy_requests`` requests, the node's walk
+    waits until ``rows`` rows are ready or ``wait_s`` has passed since it first
+    could have run. Below that it runs at once.
+    """
+    rows: int
+    wait_s: float
+    busy_requests: int
+
+
+@dataclass(frozen=True)
 class ChunkingPolicy:
     """How a walk's prefill may be split across steps; the default is not at all.
 
@@ -1215,6 +1228,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
         no-ops; override and key off ``static_output`` sentinel names.
         """
         return {}
+
+    def gather_policy(self, graph_walk: str) -> GatherPolicy | None:
+        """How long this walk's ready rows may wait for company; None runs them at once."""
+        return None
 
     def max_batch_size(self, graph_walk: str):
         return None

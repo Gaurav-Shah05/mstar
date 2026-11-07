@@ -830,6 +830,7 @@ def test_the_serial_follow_path_will_not_build_mid_replay():
         is_offloaded=lambda node, rid: False,
         check_ready=lambda *a, **kw: FULL_ADMIT_OK,
         get_max_batch_size=lambda node, walk: None,
+        get_gather_policy=lambda node, walk: None,
     )
     sched = MicroScheduler(
         engine_manager=SimpleNamespace(get_engine=lambda node: engine),
@@ -1066,6 +1067,7 @@ class _FollowSpec:
             reclaimable=lambda node, rid: 0,
             check_ready=lambda *a, **kw: FULL_ADMIT_OK,
             get_max_batch_size=lambda node, walk: None,
+            get_gather_policy=lambda node, walk: None,
         )
         self.engine_manager = SimpleNamespace(get_engine=lambda node: self.engine)
         self.scheduler = MicroScheduler(

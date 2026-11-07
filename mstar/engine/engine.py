@@ -62,6 +62,7 @@ from mstar.model.submodule_base import (
     BatchedModelOutput,
     BatchedStopCheck,
     ChunkingPolicy,
+    GatherPolicy,
     HostRows,
     InputMetadata,
     InputSeqLenInfo,
@@ -2739,6 +2740,10 @@ class Engine:
     def get_step_order(self, node_name: str, graph_walk: str) -> StepOrder:
         """The submodule's ``step_order`` for ``graph_walk``."""
         return self._submodules[node_name].submodule.step_order(graph_walk)
+
+    def get_gather_policy(self, node_name: str, graph_walk: str) -> GatherPolicy | None:
+        """The submodule's ``gather_policy`` for ``graph_walk``."""
+        return self._submodules[node_name].submodule.gather_policy(graph_walk)
 
     def get_max_batch_size(self, node_name: str, graph_walk: str) -> int | None:
         """Most requests this node will take in one step, or None for no cap.

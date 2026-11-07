@@ -51,6 +51,9 @@ class _FakeEngine:
         del node_name, graph_walk
         return False
 
+    def get_gather_policy(self, node_name, graph_walk):
+        return None
+
     def get_max_batch_size(self, node_name, graph_walk):
         """None is no cap: these tests are about the TP-follow FIFO, not caps."""
         del node_name, graph_walk

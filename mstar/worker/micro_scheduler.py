@@ -11,7 +11,7 @@ from typing import Any, NamedTuple
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.chunking import ChunkRange
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, GraphRuntime, ReadyNodeSpec, RequestWalks
-from mstar.model.submodule_base import CHUNK_LOOP_END, InputMetadata, StepOrder, chunk_loop_name
+from mstar.model.submodule_base import CHUNK_LOOP_END, GatherPolicy, InputMetadata, StepOrder, chunk_loop_name
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
 from mstar.worker.batch_builder import (
     BatchBuilderType,
@@ -435,6 +435,10 @@ class MicroScheduler:
         self._mixing_chains = self._parse_speculation_mixes_walks(
             speculation_mixes_walks or {},
         )
+        # (node, walk) -> its gather policy, asked once; key -> when its rows first
+        # could have run, while they gather (`_gathering`)
+        self._gather_policies: dict[tuple[str, str], GatherPolicy | None] = {}
+        self._gathering_since: dict[tuple[str, str], float] = {}
         # scheduling key -> whether its steps run under a token budget; see `chunks`
         self._budgeted: dict[tuple[str, str], bool] = {}
         self._max_bs: dict[tuple[str, str], int | None] = {}
@@ -605,6 +609,24 @@ class MicroScheduler:
         ``Worker._removal_step_reached``."""
         return self._last_popped_tp_seq
 
+    def _gather_policy(self, key: tuple[str, str]) -> GatherPolicy | None:
+        if key not in self._gather_policies:
+            self._gather_policies[key] = self.engine_manager.get_engine(key[0]).get_gather_policy(*key)
+        return self._gather_policies[key]
+
+    def _gathering(self, key: tuple[str, str], rows: int) -> bool:
+        """Whether ``rows`` engine-ready rows of ``key`` wait for more (``GatherPolicy``).
+        The first call that holds them, from the scheduler or a chain's peek,
+        starts the wait; a call that would not hold them, or ``note_ran``, ends it."""
+        policy = self._gather_policy(key)
+        if policy is None:
+            return False
+        if rows >= policy.rows or len(self.arrival) < policy.busy_requests:
+            self._gathering_since.pop(key, None)
+            return False
+        now = time.monotonic()
+        return now - self._gathering_since.setdefault(key, now) < policy.wait_s
+
     def _node_rr_order(
         self, ready: dict[tuple[str, str], list[ReadyNodeEntry]],
     ) -> list[tuple[str, str]]:
@@ -620,6 +642,7 @@ class MicroScheduler:
         order its step took them. Called once the step's admit has taken it,
         so the rows of a refused step keep their place in line."""
         key = self._key(batch.node_name, batch.graph_walk)
+        self._gathering_since.pop(key, None)
         turns = self.last_ran.get(key)
         if turns is None:
             turns = self.last_ran[key] = {}
@@ -1129,7 +1152,8 @@ class MicroScheduler:
         # A walk with no room (a cap of 0) takes nothing, so it stays the least
         # recent; picked anyway, it would starve the walk that frees the room.
         ready = {
-            key: rows for key, rows in ready.items() if self._walk_caps(key)[key[1]] != 0
+            key: rows for key, rows in ready.items()
+            if self._walk_caps(key)[key[1]] != 0 and not self._gathering(key, len(rows))
         }
         # Keep going down the round-robin order rather than idling behind the
         # first node whose step comes out empty. That node is not marked
@@ -2071,15 +2095,24 @@ class MicroScheduler:
         if not self.runtime.has_ready_excluding(exclude, scan_exclude):
             return False
         for spec in self._rows_here(self._ready_specs(exclude, None, scan_exclude), head_node, tp_pend_rids):
+            key = self._key(spec.node_name, spec.graph_walk)
+            # a followed head is rank 0's to run, whatever this rank's rows would wait for
+            gathers = spec.node_name != head_node and self._gather_policy(key) is not None
             node_partition = request_state.get_partition_for_node(
                 spec.node_name
             )
+            ready = 0
             for rid in spec.rids:
                 fwd_info = request_state.get_fwd_info(
                     rid, node_partition
                 )
                 if self._check_ready(spec.node_name, rid, fwd_info):
-                    return True
+                    if not gathers:
+                        return True
+                    ready += 1
+            # counted as get_next_batch counts them, or the two disagree on whether they wait
+            if ready and not self._gathering(key, ready):
+                return True
         return False
 
     def _let_rows_back(self, request_state: RequestStateManager) -> None:
