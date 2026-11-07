@@ -480,6 +480,9 @@ worker loads): ``configs/qwen3_5_9b*.yaml`` take the powers of two to 2048
 and 2176 for a mixed step, since the LLM's 2048-token step budget
 (``MAX_BATCH_TOKENS``) caps prefill and mixed steps and no bucket past 2176 is
 reached. Each bucket adds captures and startup time.
+``configs/qwen3_5_9b.yaml`` adds 1088, since a 1024-token input with its chat template
+would otherwise replay 2048: on an H200, Random 1024/256 at c=1 goes from about 58 to about
+45 ms to first token, for 248 MiB of captures.
 
 A captured decode step builds its rotary tables inside the graph from the
 planned positions, rather than staging tables built eagerly before the replay
