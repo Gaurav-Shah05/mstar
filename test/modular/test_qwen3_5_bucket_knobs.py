@@ -145,6 +145,19 @@ def test_shipped_ladders_stay_inside_dynamos_recompile_limit(monkeypatch, bucket
     assert compiles < recompile_limit()
 
 
+def test_vision_prefill_ladder_tops_at_8192(monkeypatch):
+    m = _reload(monkeypatch, "MSTAR_QWEN35_DECODE_BUCKETS", None)
+    submodule = m.LLMSubmodule.__new__(m.LLMSubmodule)
+    configs = m.LLMSubmodule.get_accelerator_graph_configs(submodule, torch.device("cpu"))
+    vision = next(c for c in configs if c.capture_graph_walk == "prefill_vision")
+    assert max(vision.capture_token_lengths) == 8192
+
+
+def test_a_1034_token_prompt_replays_1088_on_the_9b_ladder():
+    ladder = _shipped_prefill_ladders()["qwen3_5_9b.yaml"]
+    assert min(b for b in ladder if b >= 1034) == 1088
+
+
 def _compile_modes(m):
     submodule = m.LLMSubmodule.__new__(m.LLMSubmodule)
     configs = m.LLMSubmodule.get_accelerator_graph_configs(submodule, torch.device("cpu"))
