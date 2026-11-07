@@ -30,15 +30,16 @@ import pytest  # noqa: E402
 
 import mstar.worker.worker as worker_mod  # noqa: E402
 from mstar.engine.engine import ExecutingBatch  # noqa: E402
-from mstar.engine.resources.step import FULL_ADMIT_OK, StepContext  # noqa: E402
+from mstar.engine.resources.step import FULL_ADMIT_NOT_READY, FULL_ADMIT_OK, StepContext  # noqa: E402
 from mstar.graph.runtime.base import (  # noqa: E402
     ColumnarEdgeSpecs,
     PopRidsOutput,
     ReadyNodeSpec,
     SpeculationOutput,
 )
-from mstar.model.submodule_base import StepOrder  # noqa: E402
+from mstar.model.submodule_base import GatherPolicy, StepOrder  # noqa: E402
 from mstar.utils.containers import ParallelList  # noqa: E402
+from mstar.worker import micro_scheduler  # noqa: E402
 from mstar.worker.batch_builder import StepPick  # noqa: E402
 from mstar.worker.chunk_loops import ChunkLoops
 from mstar.worker.micro_scheduler import ChainPick, MicroScheduler, ScheduledBatch  # noqa: E402
@@ -84,11 +85,13 @@ class _Runtime:
         pass
 
 
-def _scheduler(runtime: _Runtime, order: StepOrder) -> tuple[MicroScheduler, SimpleNamespace]:
+def _scheduler(
+    runtime: _Runtime, order: StepOrder, policy: GatherPolicy | None = None,
+) -> tuple[MicroScheduler, SimpleNamespace]:
     engine = SimpleNamespace(
         get_max_batch_size=lambda node, walk: 1,
         batch_cap_varies=lambda node, walk: False,
-        get_gather_policy=lambda node, walk: None,
+        get_gather_policy=lambda node, walk: policy,
         get_max_batch_tokens=lambda node, walk: None,
         get_max_rows_in_combined=lambda node, walk: None,
         get_step_order=lambda node, walk: order,
@@ -123,6 +126,7 @@ def _run(
     steps: dict[int, int], order: StepOrder, arrive_at: dict[int, int] | None = None,
     elsewhere: ScheduledBatch | None = None, checks: list[tuple[bool, list[int]]] | None = None,
     refuse: frozenset[int] = frozenset(), ready_at: dict[int, int] | None = None,
+    policy: GatherPolicy | None = None,
 ) -> list[int]:
     """The rid each step served. ``steps``: rid -> loop length; ``arrive_at``:
     rid -> the step before which it arrives (default 0, in rid order);
@@ -130,9 +134,10 @@ def _run(
     of this one's; ``checks``: filled with whether a chain built each step
     and the rids its build asked the engine about; ``refuse``: the builds
     whose step the admit refuses; ``ready_at``: rid -> the step before which
-    its row reaches the node, when that is after it arrived."""
+    its row reaches the node, when that is after it arrived; ``policy``: the
+    node's gather policy."""
     runtime = _Runtime()
-    sched, state = _scheduler(runtime, order)
+    sched, state = _scheduler(runtime, order, policy)
     arrive_at = arrive_at or {}
     ready_at = {rid: (ready_at or {}).get(rid, arrive_at.get(rid, 0)) for rid in steps}
     left = dict(steps)
@@ -484,3 +489,78 @@ def test_a_chain_that_gives_its_whole_step_away_runs_the_waiting_rows():
     spec = worker._try_speculate_next(_pending(), SpeculationTarget(_TARGET, [1, 2, 3]))
 
     assert spec.scheduled_batch is waiting and spec.gave_way
+
+
+@pytest.mark.parametrize("order", [TURNS, ARRIVAL])
+def test_a_node_without_a_gather_policy_steps_as_one_whose_policy_never_applies(monkeypatch, order):
+    """GatherPolicy is opt-in. With more requests than the busy count a policy
+    would hold rows at, a node that declares none is asked, never holds a row,
+    and takes the same steps as a node whose policy never applies; the same
+    node under a policy that does apply is held."""
+    steps = {rid: 3 for rid in range(24)}
+    arrive_at = {rid: rid // 4 for rid in steps}
+    gathering, answers = MicroScheduler._gathering, []
+
+    def recorded(self, key, rows):
+        answers.append(gathering(self, key, rows))
+        return answers[-1]
+
+    monkeypatch.setattr(MicroScheduler, "_gathering", recorded)
+    served = _run(steps, order, arrive_at=arrive_at)
+    assert answers and not any(answers)
+
+    idle = GatherPolicy(rows=8, wait_s=3600.0, busy_requests=len(steps) + 1)
+    assert _run(steps, order, arrive_at=arrive_at, policy=idle) == served
+    holding = GatherPolicy(rows=len(steps) + 1, wait_s=3600.0, busy_requests=1)
+    with pytest.raises(AssertionError, match="stalled"):
+        _run(steps, order, arrive_at=arrive_at, policy=holding)
+
+
+def _held(monkeypatch):
+    """One row of a walk whose policy holds it (2 requests, 4 rows wanted, 30 ms)."""
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr(micro_scheduler.time, "monotonic", lambda: clock.now)
+    runtime = _Runtime()
+    sched, state = _scheduler(runtime, TURNS, GatherPolicy(rows=4, wait_s=0.03, busy_requests=2))
+    for rid in (0, 1):
+        runtime.requests[rid] = None
+        sched.note_arrival(rid)
+    runtime.ready = {0}
+    return clock, sched, state
+
+
+def test_a_chains_peek_starts_the_wait_and_yields_once_it_lapses(monkeypatch):
+    clock, sched, state = _held(monkeypatch)
+    chain = ("other_node", "decode")
+    assert not sched.has_ready_excluding(state, chain), "the chain keeps running while the row gathers"
+    clock.now += 0.031
+    assert sched.has_ready_excluding(state, chain), "past the wait the chain yields to the held row"
+    batch = sched.get_next_batch(state, exclude_target=chain)
+    assert batch is not None and set(batch.request_to_worker_graph) == {0}
+
+
+def test_the_scheduler_holds_a_row_until_its_wait_lapses(monkeypatch):
+    clock, sched, state = _held(monkeypatch)
+    assert sched.get_next_batch(state) is None
+    clock.now += 0.029
+    assert sched.get_next_batch(state) is None, "the wait counts from when the row first could have run"
+    clock.now += 0.002
+    batch = sched.get_next_batch(state)
+    assert batch is not None and set(batch.request_to_worker_graph) == {0}
+
+
+def test_a_peek_counts_the_rows_the_engine_would_take(monkeypatch):
+    """Four rows are on the queue but the engine takes one: the peek holds it
+    as get_next_batch does, instead of ending the wait and yielding to a step
+    that get_next_batch then holds back, pass after pass."""
+    clock, sched, state = _held(monkeypatch)
+    sched.runtime.ready = {0, 1, 2, 3}
+    engine = sched.engine_manager.get_engine(NODE)
+    engine.check_ready = lambda node, rid, fwd_info, allow_reload=True: (
+        FULL_ADMIT_OK if rid == 0 else FULL_ADMIT_NOT_READY
+    )
+    chain = ("other_node", "decode")
+    assert not sched.has_ready_excluding(state, chain)
+    assert sched.get_next_batch(state, exclude_target=chain) is None
+    clock.now += 0.031
+    assert sched.has_ready_excluding(state, chain), "the wait the peek started still lapses"
