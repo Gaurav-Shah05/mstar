@@ -1,6 +1,10 @@
-IN PROGRESS: sweep at head 6ef0789 running; gate and Python-frontend rounds follow. Numbers below are partial.
+IN PROGRESS: Python-frontend rounds at 6ef0789 running; every other number below is final.
 
-Read first: the 9B gate (section 6), main's two modes (section 5), and the Python frontend's TTFT under `siblings` (concept 1).
+Read first:
+- **The gate misses on a strict reading.** 9B images fail on all 3 PR boots (1015-1017 against a bar of 1019; main's boots read 1013-1019). One boot each of 0.8B and 9B text misses by 1-2 positions; main misses the same way. Section 6.
+- **9B MMMU c=16 is 1.5% lower on the PR with non-overlapping rounds**: 1838 [1830-1842] against 1866 [1863-1886] tok/s (concept 3).
+- **Python-frontend TTFT under `siblings`**: concept 1.
+- **Main was in its slow mode in all 3 rounds**, so the ratios are against that mode. Section 5.
 
 # PR Qwen3.5 facts
 
@@ -39,18 +43,18 @@ Read first: the 9B gate (section 6), main's two modes (section 5), and the Pytho
 ### Concept 2: GDN one-launch prefill input stage on Hopper
 - Changes: mstar/engine/resources/linear_attn/gdn_stage.py (`gdn_stage_applies`, capability 10 to 9), a comment in config.py.
 - Mechanism: on an H200 the eager path around FlashInfer's chunked kernel is about 250 small kernels and 1 ms of kernel time per mixed step (trace of Qwen3.5-0.8B ShareGPT c=64 on Nov 4: 932 kernels against decode's 335). Blackwell's one-launch Triton stage does that work in one kernel. Off NVIDIA the check stays false (mstar/platforms/interface.py:49).
-- Own effect: A/B of the stage alone at this head. The arm without it is the head with that one line at capability 10. 0.8B, 3 rounds, fresh server each, interleaved in the sweep's rounds:
+- Own effect: A/B of the stage alone at this head. Random c=16 TTFT p50 goes from 72.0 to 63.2 ms and Random c=128 tok/s rises 3% (18259 to 18751), both non-overlapping. The other cells overlap. The arm without it is the head with that one line at capability 10. 0.8B, 3 rounds, fresh server each, interleaved in the sweep's rounds:
 
 |0.8B cell|without the stage: tok/s; TTFT p50|head: tok/s; TTFT p50|ratio|
 |---|---|---|---|
-|Random 1024/256 c=1|864 [864-864]; 23.5 [23.5-23.5]|860 [860-861]; 21.9 [21.4-22.5]|1.00|
-|Random 1024/256 c=16|8198 [8198-8198]; 70.3 [70.3-70.3]|8147 [8142-8151]; 64.1 [63.2-64.9]|0.99|
-|Random 1024/256 c=64|16258 [16258-16258]; 85.2 [85.2-85.2]|15341 [15124-15557]; 101.7 [94.0-109.3]|0.94|
-|Random 1024/256 c=128|18199 [18199-18199]; 122.1 [122.1-122.1]|18842 [18751-18932]; 169.1 [163.1-175.1]|1.04|
-|ShareGPT c=1|908 [908-908]; 12.7 [12.7-12.7]|881 [867-895]; 13.7 [12.5-14.8]|0.97|
-|ShareGPT c=16|8532 [8532-8532]; 16.1 [16.1-16.1]|8369 [8140-8598]; 16.4 [15.6-17.3]|0.98|
-|ShareGPT c=64|16105 [16105-16105]; 26.5 [26.5-26.5]|15920 [15349-16491]; 26.4 [25.7-27.2]|0.99|
-|ShareGPT c=128|21418 [21418-21418]; 37.6 [37.6-37.6]|19605 [18708-20502]; 39.8 [38.8-40.8]|0.92|
+|Random 1024/256 c=1|864 [855-869]; 23.5 [23.1-24.8]|861 [860-864]; 22.5 [21.4-22.5]|1.00|
+|Random 1024/256 c=16|8023 [8005-8198]; 72.0 [70.3-74.1]|8151 [8142-8209]; 63.2 [56.6-64.9]|1.02|
+|Random 1024/256 c=64|15573 [15442-16258]; 101.0 [85.2-106.8]|15557 [15124-16172]; 94.0 [82.1-109.3]|1.00|
+|Random 1024/256 c=128|18259 [18199-18616]; 172.9 [122.1-183.9]|18751 [18692-18932]; 163.1 [145.2-175.1]|1.03|
+|ShareGPT c=1|896 [880-908]; 13.3 [12.7-16.1]|895 [867-903]; 13.2 [12.5-14.8]|1.00|
+|ShareGPT c=16|8164 [7913-8532]; 16.3 [16.1-17.5]|8567 [8140-8598]; 15.6 [15.2-17.3]|1.05|
+|ShareGPT c=64|15330 [14728-16105]; 27.8 [26.5-28.9]|15703 [15349-16491]; 27.2 [25.7-27.5]|1.02|
+|ShareGPT c=128|20480 [19222-21418]; 38.1 [37.6-38.8]|20502 [18708-21411]; 38.8 [37.2-40.8]|1.00|
 
 - Cost: it moves greedy outputs by rounding. On Nov 6, 2B images against main went from 11-14 of 16 identical (concept 1 alone) to 9-11 (with the stage), while staying stable against themselves (14 of 16). Agreement with HF stays above the bar (section 6).
 - Hopper runs on the H200 at this head: test_a_staged_mixed_split_matches_the_chunked_path (15 cases) and test_chunked_kernel_agrees_through_either_path: 16 passed. The GDN, Qwen3.5, GLM5-Next and Nemotron Duplex modular files: 496 passed, 1 failed (test_duplex_load_audio_refuses_a_file_past_the_session, in the base set).
@@ -62,9 +66,10 @@ Read first: the 9B gate (section 6), main's two modes (section 5), and the Pytho
 - Mechanism: a prefill_vision step past 4096 tokens ran eagerly, and the first such step on a fresh server stalled every row in flight (5.6 s for a 5360-token image on 2B). It now replays a capture. The tower's block loop still tops out at 16384 patches, so such an image's tower runs uncaptured.
 - Own effect (Nov 6 ladder): 2B MMMU c=16 3216 to 4275 tok/s, with non-overlapping rounds.
 - 9B boot time and free memory after capture, from the sweep's servers:
-  - main: r1 boot 473 s, 94279 MiB free, largest eager 403 MiB
-  - head: r1 boot 461 s, 94027 MiB free, largest eager 705 MiB
+  - main: r1 boot 473 s, 94279 MiB free, largest eager 403 MiB; r2 boot 458 s, 94279 MiB free, largest eager 403 MiB; r3 boot 410 s, 94279 MiB free, largest eager 403 MiB
+  - head: r1 boot 461 s, 94027 MiB free, largest eager 705 MiB; r2 boot 410 s, 94027 MiB free, largest eager 705 MiB; r3 boot 462 s, 94027 MiB free, largest eager 705 MiB
   - The head's 9B also carries concept 4's 248 MiB.
+- Cost: 9B MMMU c=16 tok/s is 1.5% lower than main with non-overlapping rounds (section 5), and c=4 is 21% higher. On Nov 5 this bucket alone measured 9B c=16 about 2% lower than without it; the cause was not found.
 - 27B TP4 needs 4 GPUs and this pod has one, so it wasn't run. The 27B and Qwen3.8 configs inherit the bucket.
 - Compile count is 83 of Dynamo's 84 on the default ladder (test_shipped_ladders_stay_inside_dynamos_recompile_limit).
 - Tests: test_qwen3_5_bucket_knobs.py::test_vision_prefill_ladder_tops_at_8192, which fails on the parent.
@@ -81,59 +86,138 @@ Hypothesis "PR check: qwen35", rows started Nov 7. `M* main 305e80e` (baseline) 
 
 |cell|M* main 305e80e tok/s|M* main 305e80e TTFT p50 ms|M* pr-qwen35 6ef0789 tok/s|M* pr-qwen35 6ef0789 TTFT p50 ms|ratio tok/s|
 |---|---|---|---|---|---|
-|Qwen3.5-0.8B Random 1024/256 c=1 (n=2,2)|488 [479-498]|26.9 [26.7-27.0]|860 [860-861]|21.9 [21.4-22.5]|1.76|
-|Qwen3.5-0.8B Random 1024/256 c=16 (n=2,2)|5286 [5046-5526]|63.1 [62.0-64.3]|8147 [8142-8151]|64.1 [63.2-64.9]|1.54|
-|Qwen3.5-0.8B Random 1024/256 c=64 (n=2,2)|9786 [9322-10249]|92.7 [82.1-103.3]|15341 [15124-15557]|101.7 [94.0-109.3]|1.57|
-|Qwen3.5-0.8B Random 1024/256 c=128 (n=2,2)|12165 [12069-12261]|117.9 [110.9-124.9]|18842 [18751-18932]|169.1 [163.1-175.1]|1.55|
-|Qwen3.5-0.8B ShareGPT c=1 (n=2,2)|490 [465-515]|18.4 [18.4-18.5]|881 [867-895]|13.7 [12.5-14.8]|1.80|
-|Qwen3.5-0.8B ShareGPT c=16 (n=2,2)|4492 [4136-4847]|24.4 [22.9-25.8]|8369 [8140-8598]|16.4 [15.6-17.3]|1.86|
-|Qwen3.5-0.8B ShareGPT c=64 (n=2,2)|7974 [7956-7992]|38.6 [38.5-38.7]|15920 [15349-16491]|26.4 [25.7-27.2]|2.00|
-|Qwen3.5-0.8B ShareGPT c=128 (n=2,2)|9815 [9695-9936]|56.5 [55.9-57.0]|19605 [18708-20502]|39.8 [38.8-40.8]|2.00|
-|Qwen3.5-2B Image (MMMU) c=4 (n=1,1)|910 [910-910]|92.8 [92.8-92.8]|1414 [1414-1414]|66.4 [66.4-66.4]|1.55|
-|Qwen3.5-2B Image (MMMU) c=16 (n=1,1)|3726 [3726-3726]|121.5 [121.5-121.5]|4448 [4448-4448]|93.0 [93.0-93.0]|1.19|
-|Qwen3.5-2B Random 1024/256 c=1 (n=1,1)|517 [517-517]|32.7 [32.7-32.7]|604 [604-604]|26.5 [26.5-26.5]|1.17|
-|Qwen3.5-2B Random 1024/256 c=16 (n=1,1)|4489 [4489-4489]|79.4 [79.4-79.4]|6144 [6144-6144]|78.3 [78.3-78.3]|1.37|
-|Qwen3.5-2B Random 1024/256 c=64 (n=1,1)|11382 [11382-11382]|91.2 [91.2-91.2]|13698 [13698-13698]|112.8 [112.8-112.8]|1.20|
-|Qwen3.5-2B Random 1024/256 c=128 (n=1,1)|13967 [13967-13967]|120.8 [120.8-120.8]|16500 [16500-16500]|109.5 [109.5-109.5]|1.18|
-|Qwen3.5-2B ShareGPT c=1 (n=1,1)|442 [442-442]|19.8 [19.8-19.8]|632 [632-632]|14.3 [14.3-14.3]|1.43|
-|Qwen3.5-2B ShareGPT c=16 (n=1,1)|4370 [4370-4370]|24.7 [24.7-24.7]|6517 [6517-6517]|17.1 [17.1-17.1]|1.49|
-|Qwen3.5-2B ShareGPT c=64 (n=1,1)|7400 [7400-7400]|40.7 [40.7-40.7]|13814 [13814-13814]|26.8 [26.8-26.8]|1.87|
-|Qwen3.5-2B ShareGPT c=128 (n=1,1)|9434 [9434-9434]|59.6 [59.6-59.6]|18863 [18863-18863]|38.5 [38.5-38.5]|2.00|
-|Qwen3.5-9B Image (MMMU) c=4 (n=1,1)|471 [471-471]|101.6 [101.6-101.6]|571 [571-571]|94.7 [94.7-94.7]|1.21|
-|Qwen3.5-9B Image (MMMU) c=16 (n=1,1)|1886 [1886-1886]|229.4 [229.4-229.4]|1830 [1830-1830]|171.4 [171.4-171.4]|0.97|
-|Qwen3.5-9B Random 1024/256 c=1 (n=1,1)|211 [211-211]|60.9 [60.9-60.9]|201 [201-201]|42.3 [42.3-42.3]|0.95|
-|Qwen3.5-9B Random 1024/256 c=64 (n=1,1)|4473 [4473-4473]|277.1 [277.1-277.1]|4561 [4561-4561]|265.7 [265.7-265.7]|1.02|
-|Qwen3.5-9B ShareGPT c=1 (n=1,1)|217 [217-217]|26.6 [26.6-26.6]|204 [204-204]|22.9 [22.9-22.9]|0.94|
-|Qwen3.5-9B ShareGPT c=64 (n=1,1)|5240 [5240-5240]|49.4 [49.4-49.4]|5443 [5443-5443]|46.9 [46.9-46.9]|1.04|
+|Qwen3.5-0.8B Random 1024/256 c=1 (n=3,3)|479 [444-498]|27.0 [26.7-27.4]|861 [860-864]|22.5 [21.4-22.5]|1.80|
+|Qwen3.5-0.8B Random 1024/256 c=16 (n=3,3)|5214 [5046-5526]|64.3 [62.0-64.6]|8151 [8142-8209]|63.2 [56.6-64.9]|1.56|
+|Qwen3.5-0.8B Random 1024/256 c=64 (n=3,3)|10249 [9322-10444]|97.4 [82.1-103.3]|15557 [15124-16172]|94.0 [82.1-109.3]|1.52|
+|Qwen3.5-0.8B Random 1024/256 c=128 (n=3,3)|12261 [12069-13926]|124.9 [110.9-141.4]|18751 [18692-18932]|163.1 [145.2-175.1]|1.53|
+|Qwen3.5-0.8B ShareGPT c=1 (n=3,3)|480 [465-515]|18.4 [17.9-18.5]|895 [867-903]|13.2 [12.5-14.8]|1.86|
+|Qwen3.5-0.8B ShareGPT c=16 (n=3,3)|4354 [4136-4847]|23.5 [22.9-25.8]|8567 [8140-8598]|15.6 [15.2-17.3]|1.97|
+|Qwen3.5-0.8B ShareGPT c=64 (n=3,3)|7956 [7327-7992]|38.7 [38.5-40.2]|15703 [15349-16491]|27.2 [25.7-27.5]|1.97|
+|Qwen3.5-0.8B ShareGPT c=128 (n=3,3)|9695 [9664-9936]|57.0 [55.9-58.3]|20502 [18708-21411]|38.8 [37.2-40.8]|2.11|
+|Qwen3.5-2B Image (MMMU) c=4 (n=3,3)|880 [870-910]|91.3 [82.8-92.8]|1385 [1380-1414]|65.5 [64.0-66.4]|1.57|
+|Qwen3.5-2B Image (MMMU) c=16 (n=3,3)|3726 [3381-3770]|121.5 [104.1-132.9]|4354 [4334-4448]|95.9 [93.0-100.5]|1.17|
+|Qwen3.5-2B Random 1024/256 c=1 (n=3,3)|499 [442-517]|32.7 [31.9-32.9]|590 [582-604]|28.0 [26.5-28.7]|1.18|
+|Qwen3.5-2B Random 1024/256 c=16 (n=3,3)|4736 [4489-5054]|82.4 [79.4-83.7]|6118 [6085-6144]|80.2 [78.3-85.4]|1.29|
+|Qwen3.5-2B Random 1024/256 c=64 (n=3,3)|11114 [10998-11382]|91.2 [90.3-97.5]|13698 [13599-13766]|119.8 [112.8-120.0]|1.23|
+|Qwen3.5-2B Random 1024/256 c=128 (n=3,3)|12569 [11257-13967]|123.2 [120.8-148.7]|16500 [16373-16516]|133.0 [109.5-164.4]|1.31|
+|Qwen3.5-2B ShareGPT c=1 (n=3,3)|442 [439-471]|20.2 [19.8-20.4]|618 [605-632]|16.3 [14.3-17.9]|1.40|
+|Qwen3.5-2B ShareGPT c=16 (n=3,3)|4494 [4370-4558]|24.2 [23.5-24.7]|6352 [6334-6517]|18.3 [17.1-18.5]|1.41|
+|Qwen3.5-2B ShareGPT c=64 (n=3,3)|7686 [7400-7740]|40.4 [39.7-40.7]|13089 [13050-13814]|29.4 [26.8-30.4]|1.70|
+|Qwen3.5-2B ShareGPT c=128 (n=3,3)|9728 [9434-9830]|57.7 [57.6-59.6]|18203 [18128-18863]|40.7 [38.5-40.9]|1.87|
+|Qwen3.5-9B Image (MMMU) c=4 (n=3,3)|471 [471-473]|103.3 [101.6-114.9]|571 [566-571]|94.7 [94.3-111.4]|1.21|
+|Qwen3.5-9B Image (MMMU) c=16 (n=3,3)|1866 [1863-1886]|201.9 [190.8-229.4]|1838 [1830-1842]|184.3 [171.4-190.8]|0.98|
+|Qwen3.5-9B Random 1024/256 c=1 (n=3,3)|198 [198-211]|63.1 [60.9-64.8]|201 [200-201]|42.8 [42.3-43.0]|1.02|
+|Qwen3.5-9B Random 1024/256 c=64 (n=3,3)|4474 [4473-4478]|276.9 [275.2-277.1]|4561 [4552-4561]|268.1 [265.7-269.4]|1.02|
+|Qwen3.5-9B ShareGPT c=1 (n=3,3)|204 [204-217]|25.7 [24.7-26.6]|204 [204-205]|23.3 [22.9-25.2]|1.00|
+|Qwen3.5-9B ShareGPT c=64 (n=3,3)|5257 [5240-5292]|49.4 [48.3-50.1]|5438 [5430-5443]|46.9 [46.6-48.6]|1.03|
 
-**Main's modes:** 0.8B ShareGPT c=64 by round: r1 7956 (slow); r2 7992 (slow). A fast round is one where main reads about 14000 without pinning. Nov 6 traced fast rounds to time windows rather than workload order; their cause is a hypothesis (host load keeping cores out of C2), and host samples were taken through this sweep (results hostsample.tsv). The table compares against whichever mode main was in.
+**Main's modes:** 0.8B ShareGPT c=64 by round: r1 7956 (slow); r2 7992 (slow); r3 7327 (slow). A fast round is one where main reads about 14000 without pinning. Nov 6 traced fast rounds to time windows rather than workload order; their cause is a hypothesis (host load keeping cores out of C2), and host samples were taken through this sweep (results hostsample.tsv). The table compares against whichever mode main was in.
 
 ## 6. Correctness
 Teacher-forced top-1 against transformers sdpa, 64 greedy tokens per prompt, on 64 ShareGPT prompts (and 16 MMMU images for 2B and 9B), from each of the 3 sweep boots per tree. The bar is transformers eager greedy, scored the same way.
-not scored (out of time)
+
+0.8B:
+```
+hf eager   text  4081/4096 = 0.99634
+
+PASS text  4085/4096 = 0.99731 6ef0789/0.8b/r1/parity.json
+
+PASS text  4086/4096 = 0.99756 6ef0789/0.8b/r2/parity.json
+
+FAIL text  4080/4096 = 0.99609 6ef0789/0.8b/r3/parity.json
+
+PASS text  4082/4096 = 0.99658 main/0.8b/r1/parity.json
+
+PASS text  4081/4096 = 0.99634 main/0.8b/r2/parity.json
+
+FAIL text  4079/4096 = 0.99585 main/0.8b/r3/parity.json
+
+```
+2B:
+```
+hf eager   text  4075/4096 = 0.99487
+
+PASS text  4083/4096 = 0.99683 6ef0789/2b/r1/parity.json
+
+PASS text  4084/4096 = 0.99707 6ef0789/2b/r2/parity.json
+
+PASS text  4080/4096 = 0.99609 6ef0789/2b/r3/parity.json
+
+PASS text  4079/4096 = 0.99585 main/2b/r1/parity.json
+
+PASS text  4080/4096 = 0.99609 main/2b/r2/parity.json
+
+PASS text  4076/4096 = 0.99512 main/2b/r3/parity.json
+
+hf eager   image 1010/1024 = 0.98633
+
+PASS image 1015/1024 = 0.99121 6ef0789/2b/r1/parity.json
+
+PASS image 1015/1024 = 0.99121 6ef0789/2b/r2/parity.json
+
+PASS image 1014/1024 = 0.99023 6ef0789/2b/r3/parity.json
+
+PASS image 1015/1024 = 0.99121 main/2b/r1/parity.json
+
+PASS image 1012/1024 = 0.98828 main/2b/r2/parity.json
+
+PASS image 1015/1024 = 0.99121 main/2b/r3/parity.json
+
+```
+9B:
+```
+hf eager   text  4080/4096 = 0.99609
+
+PASS text  4081/4096 = 0.99634 6ef0789/9b/r1/parity.json
+
+PASS text  4083/4096 = 0.99683 6ef0789/9b/r2/parity.json
+
+FAIL text  4078/4096 = 0.99561 6ef0789/9b/r3/parity.json
+
+PASS text  4080/4096 = 0.99609 main/9b/r1/parity.json
+
+FAIL text  4078/4096 = 0.99561 main/9b/r2/parity.json
+
+PASS text  4081/4096 = 0.99634 main/9b/r3/parity.json
+
+hf eager   image 1019/1024 = 0.99512
+
+FAIL image 1015/1024 = 0.99121 6ef0789/9b/r1/parity.json
+
+FAIL image 1015/1024 = 0.99121 6ef0789/9b/r2/parity.json
+
+FAIL image 1017/1024 = 0.99316 6ef0789/9b/r3/parity.json
+
+FAIL image 1017/1024 = 0.99316 main/9b/r1/parity.json
+
+FAIL image 1013/1024 = 0.98926 main/9b/r2/parity.json
+
+PASS image 1019/1024 = 0.99512 main/9b/r3/parity.json
+
+```
 
 On Nov 6 every 9B miss, the bar's and both trees', was a near-tie: a log-prob gap of at most 0.25 nats under sdpa at bf16. Main missed the 9B bar the same way.
 
 Greedy agreement across boots (identical of N, mean prefix), PR-main, main-main and PR-PR:
 ```
-0.8 text main-main [(57, 64, 0.9753)]
-0.8 text pr-main [(59, 64, 0.978), (56, 64, 0.9761), (56, 64, 0.9736), (56, 64, 0.9619)]
-0.8 text pr-pr [(56, 64, 0.9634)]
-0.8 image main-main [(14, 16, 0.915)]
-0.8 image pr-main [(12, 16, 0.8369), (12, 16, 0.8262), (13, 16, 0.8867), (13, 16, 0.8975)]
-0.8 image pr-pr [(11, 16, 0.8311)]
-2 text main-main []
-2 text pr-main [(52, 64, 0.8892)]
-2 text pr-pr []
-2 image main-main []
-2 image pr-main [(11, 16, 0.8506)]
-2 image pr-pr []
-9 text main-main []
-9 text pr-main [(51, 64, 0.8875)]
-9 text pr-pr []
-9 image main-main []
-9 image pr-main [(13, 16, 0.9316)]
-9 image pr-pr []
+0.8 text main-main [(57, 64, 0.9753), (53, 64, 0.9534), (55, 64, 0.9651)]
+0.8 text pr-main [(59, 64, 0.978), (56, 64, 0.9761), (52, 64, 0.95), (56, 64, 0.9736), (56, 64, 0.9619), (52, 64, 0.9604), (58, 64, 0.97), (53, 64, 0.9524), (52, 64, 0.939)]
+0.8 text pr-pr [(56, 64, 0.9634), (56, 64, 0.9551), (55, 64, 0.9536)]
+0.8 image main-main [(14, 16, 0.915), (12, 16, 0.8037), (13, 16, 0.8477)]
+0.8 image pr-main [(12, 16, 0.8369), (12, 16, 0.8262), (13, 16, 0.8936), (13, 16, 0.8867), (13, 16, 0.8975), (12, 16, 0.8525), (14, 16, 0.8984), (14, 16, 0.9092), (13, 16, 0.8643)]
+0.8 image pr-pr [(11, 16, 0.8311), (12, 16, 0.8428), (15, 16, 0.9883)]
+2 text main-main [(53, 64, 0.9346), (51, 64, 0.9001), (49, 64, 0.9077)]
+2 text pr-main [(52, 64, 0.8892), (49, 64, 0.884), (47, 64, 0.8772), (52, 64, 0.8872), (51, 64, 0.8953), (49, 64, 0.8826), (47, 64, 0.8662), (49, 64, 0.8831), (43, 64, 0.8452)]
+2 text pr-pr [(56, 64, 0.9424), (54, 64, 0.9319), (52, 64, 0.9148)]
+2 image main-main [(11, 16, 0.9121), (12, 16, 0.959), (13, 16, 0.9375)]
+2 image pr-main [(11, 16, 0.8506), (12, 16, 0.8467), (13, 16, 0.876), (11, 16, 0.8867), (9, 16, 0.8223), (12, 16, 0.8848), (12, 16, 0.9248), (11, 16, 0.8643), (14, 16, 0.9268)]
+2 image pr-pr [(10, 16, 0.8428), (12, 16, 0.9033), (13, 16, 0.9326)]
+9 text main-main [(51, 64, 0.8921), (53, 64, 0.9343), (52, 64, 0.9238)]
+9 text pr-main [(51, 64, 0.8875), (51, 64, 0.8994), (57, 64, 0.9336), (53, 64, 0.9075), (49, 64, 0.8784), (55, 64, 0.9375), (52, 64, 0.9124), (49, 64, 0.8879), (54, 64, 0.8979)]
+9 text pr-pr [(60, 64, 0.9771), (55, 64, 0.9082), (55, 64, 0.9263)]
+9 image main-main [(12, 16, 0.9111), (14, 16, 0.9736), (11, 16, 0.8916)]
+9 image pr-main [(13, 16, 0.9316), (14, 16, 0.9355), (12, 16, 0.9238), (13, 16, 0.9141), (14, 16, 0.9531), (12, 16, 0.9062), (13, 16, 0.9453), (12, 16, 0.9062), (14, 16, 0.9531)]
+9 image pr-pr [(14, 16, 0.9395), (14, 16, 0.9707), (12, 16, 0.9102)]
 ```
 
 ## 7. Tests
@@ -160,6 +244,7 @@ Greedy agreement across boots (identical of N, mean prefix), PR-main, main-main 
 - The Python frontend's TTFT under siblings: the configs now set siblings, and `mstar serve` without `--rust-frontend` pays it (concept 1 table).
 - Main's two modes: the cause is a hypothesis.
 - The 9B gate: misses on main too, and the cause of eager's lead on images is not established.
+- 9B MMMU c=16: 1.5% lower than main; cause not found.
 - TP, multi-GPU, 27B, Qwen3.8 and Blackwell: not run.
 - 1088 covers only prompts near 1034 tokens. A 1200-token prompt still pads to 2048.
 - Numbers are at -O1.
